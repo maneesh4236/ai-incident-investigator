@@ -1,0 +1,87 @@
+version: "3.9"
+
+services:
+  neo4j:
+    image: neo4j:5.24-community
+    container_name: aether-neo4j
+    ports:
+      - "7474:7474" # Browser UI
+      - "7687:7687" # Bolt
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-change_me_password}
+      NEO4J_PLUGINS: '["apoc"]'
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:7474"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:v1.11.2
+    container_name: aether-qdrant
+    ports:
+      - "6333:6333" # REST
+      - "6334:6334" # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:6333/readyz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: aether-backend
+    ports:
+      - "8000:8000"
+    environment:
+      ENV: production
+      CORS_ORIGINS: '["http://localhost:3000"]'
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-large-en-v1.5}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: 6333
+      QDRANT_COLLECTION: incident_chunks
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-change_me_password}
+      NEO4J_DATABASE: neo4j
+      UPLOAD_DIR: /app/data/uploads
+    volumes:
+      - backend_uploads:/app/data/uploads
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE_URL: http://localhost:8000/api
+    container_name: aether-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000/api
+    depends_on:
+      - backend
+
+volumes:
+  neo4j_data:
+  qdrant_data:
+  backend_uploads:

@@ -1,0 +1,51 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  background-color: #0a0e13;
+  color: #e8edf2;
+}
+
+* {
+  border-color: #1e2a36;
+}
+
+::selection {
+  background-color: #7a5a28;
+  color: #0a0e13;
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background-color: #1e2a36;
+  border-radius: 4px;
+}
+
+.status-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+}
+
+@keyframes pulse-signal {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+.animate-pulse-signal {
+  animation: pulse-signal 1.6s ease-in-out infinite;
+}
