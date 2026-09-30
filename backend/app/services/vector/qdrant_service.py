@@ -26,7 +26,8 @@ class QdrantService:
         self._fallback_store: dict[str, list[tuple[Chunk, List[float]]]] = {}
 
         try:
-            self._client = QdrantClient(host=settings.QDRANT_HOST, port=settings.QDRANT_PORT, timeout=5)
+            #self._client = QdrantClient(host=settings.QDRANT_HOST, port=settings.QDRANT_PORT, timeout=5)
+            self._client = QdrantClient(path="./qdrant_data")
             self._ensure_collection()
             logger.info(f"Connected to Qdrant at {settings.QDRANT_HOST}:{settings.QDRANT_PORT}")
         except Exception as exc:  # pragma: no cover - depends on infra availability
