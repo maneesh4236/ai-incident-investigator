@@ -28,3 +28,9 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+
+# Data
+backend/data/
+data/uploads/
+backend/qdrant_data/
