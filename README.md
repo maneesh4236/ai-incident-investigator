@@ -129,8 +129,41 @@ ai-investigator/
 - **Repository pattern** for investigation/document/chunk state
   (`incident_repository.py`), **service layer pattern** for all business
   logic, and a small **dependency-injection container** for wiring.
-- **Async FastAPI**, typed Pydantic schemas shared across the whole backend,
-  structured logging via loguru, and retry/backoff around LLM calls.
+- **FastAPI** with blocking work in sync routes (threadpool), typed Pydantic
+  schemas shared across the whole backend, structured logging via loguru, and
+  bounded retry/backoff around LLM calls.
+
+## Large logs and the Gemini call policy
+
+Gemini usage does not grow with log size:
+
+| Request | Gemini calls |
+|---|---|
+| `POST /upload` | 0 (fully deterministic) |
+| `POST /investigate` | exactly 1 |
+| `POST /chat` | exactly 1 per question |
+
+The limit is enforced per request (`core/metrics.py` + `GeminiClient`), not just by convention.
+
+Pipeline for logs:
+
+1. **Event parsing** (`ingestion/log_loader.py`): a timestamped header line plus its continuation
+   lines (stack frames, `Caused by:`) form one event; events are never split and keep their raw text.
+2. **Templates, tags, dedup** (`ingestion/event_processor.py`): variable tokens are masked into templates;
+   RCA signals (timeouts, 5xx, pool, leak, recovery, diagnosis, …) are tagged; repeats are grouped while every
+   instance, burst, metric trend and distinct request id is kept.
+3. **Qdrant** gets one point per group; the **knowledge graph** is built deterministically
+   (CAUSES only from explicit causal wording; temporal order is PRECEDES; co-occurrence is RELATED_TO).
+4. **Evidence selection** (`reasoning/evidence_selector.py`) protects first ERROR/CRITICAL occurrences,
+   precursors, diagnosis/recovery events and distinct occurrences, then fills by score, under a hard budget
+   (`MAX_GEMINI_EVIDENCE_TOKENS=4000` inside `MAX_GEMINI_CONTEXT_TOKENS=6000`).
+5. **One Gemini call** returns root cause, cause chain, typed claims
+   (OBSERVED / INFERRED / LIKELY / CONFIRMED / UNKNOWN) with `E#####` citations and timeline phase labels.
+   Citations are validated: invented ids are dropped and unsupported claim types are downgraded.
+6. If Gemini is unavailable (429 / 5xx / timeout / quota / invalid output) the report is built
+   deterministically from the same evidence and marked `degraded: true`; nothing is left in `PROCESSING`.
+
+`GET /api/metrics` exposes Gemini calls, attempts, retries, errors by kind, latency, tokens and pipeline counters.
 
 ## Getting started
 

@@ -1,0 +1,31 @@
+2030-02-11 14:00:00.101 INFO  [edge-proxy] [req-5001] Request received GET /carts/77
+2030-02-11 14:00:00.140 INFO  [cart-service] [req-5001] Loading cart
+2030-02-11 14:00:00.188 INFO  [store-db] [req-5001] Query executed in 21ms
+
+2030-02-11 14:01:10.300 WARN  [store-db] Pool usage at 71%
+2030-02-11 14:01:12.220 WARN  [store-db] Query latency exceeded threshold: 380ms
+2030-02-11 14:01:13.900 WARN  [store-db] Query latency exceeded threshold: 540ms
+
+2030-02-11 14:02:30.010 WARN  [store-db] Pool usage at 90%
+2030-02-11 14:02:31.450 WARN  [store-db] Active connections: 176/200
+
+2030-02-11 14:03:05.700 ERROR [store-db] Connection acquisition timeout
+2030-02-11 14:03:05.810 ERROR [billing-service] Unable to load invoice state
+
+2030-02-11 14:03:07.120 ERROR [cart-service] Failed to load cart contents
+java.sql.SQLTransientConnectionException: Connection is not available, request timed out after 3000ms
+	at com.zaxxer.hikari.pool.HikariPool.createTimeoutException(HikariPool.java:696)
+	at com.zaxxer.hikari.pool.HikariPool.getConnection(HikariPool.java:181)
+	at com.example.cart.CartRepository.load(CartRepository.java:42)
+Caused by: java.net.SocketTimeoutException: Read timed out
+	at java.base/java.net.SocketInputStream.socketRead0(Native Method)
+	... 12 more
+
+2030-02-11 14:03:20.010 ERROR [edge-proxy] Returning HTTP 500 for request req-5003
+2030-02-11 14:03:21.020 ERROR [edge-proxy] Returning HTTP 500 for request req-5004
+
+2030-02-11 14:04:00.500 CRITICAL [watchdog-service] P1 Incident Triggered
+2030-02-11 14:04:30.000 INFO  [ops-bot] Restarting DB connection pool
+2030-02-11 14:05:02.300 INFO  [store-db] Query latency normalized: 40ms
+2030-02-11 14:05:10.900 INFO  [cart-service] Cart loading restored
+2030-02-11 14:05:30.100 INFO  [watchdog-service] Incident resolved

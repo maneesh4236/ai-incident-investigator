@@ -13,7 +13,7 @@ from neo4j import GraphDatabase
 
 from app.core.config import get_settings
 from app.core.logging_config import get_logger
-from app.models.schemas import GraphEntity, GraphRelationship
+from app.models.schemas import EntityType, GraphEntity, GraphRelationship, RelationType
 
 logger = get_logger("graph.neo4j_service")
 
@@ -83,6 +83,64 @@ class Neo4jService:
                 evidence=rel.evidence_chunk_ids,
             )
 
+    def upsert_batch(self, entities: List[GraphEntity], relationships: List[GraphRelationship]) -> int:
+        """Writes entities and relationships in one session / transaction using
+        UNWIND, one query per entity type and per relation type (labels and
+        relationship types come from enums, so interpolation is safe).
+        Returns the number of queries executed."""
+        if not self._driver or (not entities and not relationships):
+            return 0
+        by_type: dict[str, list[dict]] = {}
+        for e in entities:
+            by_type.setdefault(EntityType(e.type).value, []).append(
+                {"name": e.name, "investigation_id": e.investigation_id, "id": e.id,
+                 "type": EntityType(e.type).value, "source_chunk_ids": e.source_chunk_ids}
+            )
+        rels_by_type: dict[str, list[dict]] = {}
+        for r in relationships:
+            rels_by_type.setdefault(RelationType(r.type).value, []).append(
+                {"source": r.source, "target": r.target, "investigation_id": r.investigation_id, "id": r.id,
+                 "confidence": r.confidence, "evidence": r.evidence_chunk_ids, "basis": r.basis,
+                 "evidence_event_ids": r.evidence_event_ids, "timestamp": r.timestamp}
+            )
+        queries = 0
+
+        def work(tx):
+            nonlocal queries
+            for label, rows in by_type.items():
+                tx.run(
+                    """
+                    UNWIND $rows AS row
+                    MERGE (e:Entity {name: row.name, investigation_id: row.investigation_id})
+                    ON CREATE SET e.id = row.id, e.type = row.type, e.source_chunk_ids = row.source_chunk_ids
+                    ON MATCH SET e.source_chunk_ids = coalesce(e.source_chunk_ids, []) + row.source_chunk_ids
+                    SET e:%s
+                    """ % label,
+                    rows=rows,
+                )
+                queries += 1
+            for rtype, rows in rels_by_type.items():
+                tx.run(
+                    """
+                    UNWIND $rows AS row
+                    MERGE (a:Entity {name: row.source, investigation_id: row.investigation_id})
+                    MERGE (b:Entity {name: row.target, investigation_id: row.investigation_id})
+                    MERGE (a)-[r:%s {investigation_id: row.investigation_id}]->(b)
+                    ON CREATE SET r.id = row.id, r.confidence = row.confidence, r.evidence_chunk_ids = row.evidence,
+                                  r.basis = row.basis, r.evidence_event_ids = row.evidence_event_ids,
+                                  r.timestamp = row.timestamp
+                    """ % rtype,
+                    rows=rows,
+                )
+                queries += 1
+
+        try:
+            with self._driver.session(database=self._settings.NEO4J_DATABASE) as session:
+                session.execute_write(work)
+        except Exception as exc:  # graph persistence must never break ingestion
+            logger.warning(f"Neo4j batch upsert failed ({exc}); in-memory graph remains authoritative")
+        return queries
+
     # ------------------------------------------------------------------ #
     # Reads
     # ------------------------------------------------------------------ #
@@ -92,7 +150,8 @@ class Neo4jService:
         node_query = "MATCH (e:Entity {investigation_id: $iid}) RETURN e"
         edge_query = """
         MATCH (a:Entity {investigation_id: $iid})-[r]->(b:Entity {investigation_id: $iid})
-        RETURN a.name AS source, b.name AS target, type(r) AS type, r.confidence AS confidence, r.id AS id
+        RETURN a.name AS source, b.name AS target, type(r) AS type, r.confidence AS confidence, r.id AS id,
+               r.basis AS basis, r.evidence_event_ids AS evidence_event_ids, r.timestamp AS timestamp
         """
         with self._driver.session(database=self._settings.NEO4J_DATABASE) as session:
             nodes = [dict(record["e"]) for record in session.run(node_query, iid=investigation_id)]

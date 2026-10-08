@@ -15,7 +15,7 @@ router = APIRouter(tags=["graph"])
 
 
 @router.get("/graph/{investigation_id}")
-async def get_graph(
+def get_graph(  # sync: Neo4j reads run in the threadpool, not on the event loop
     investigation_id: str,
     repo=Depends(get_incident_repository),
     graph_builder=Depends(get_graph_builder),

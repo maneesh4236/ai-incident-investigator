@@ -1,0 +1,13 @@
+2030-01-05 08:00:01 INFO Deployment started version=v4.0.1
+
+2030-01-05 08:01:40 WARN Queue consumer lag increased
+
+2030-01-05 08:02:55 ERROR Cache timeout after 3000ms
+
+2030-01-05 08:03:30 ERROR Checkout service unavailable
+
+2030-01-05 08:04:10 ERROR HTTP 502 returned to client
+
+2030-01-05 08:05:00 INFO Rollback initiated
+
+2030-01-05 08:06:45 INFO Service recovered

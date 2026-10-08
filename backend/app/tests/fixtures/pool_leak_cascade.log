@@ -1,0 +1,32 @@
+2030-03-20 09:00:01 web-gateway INFO Request received POST /transfers
+2030-03-20 09:00:01 ledger-service INFO Transfer started txnId=TX90001
+2030-03-20 09:00:02 ledger-db INFO SQL execution completed in 38 ms
+2030-03-20 09:00:04 ledger-service INFO DbPool active=10 idle=90 total=100
+
+2030-03-20 09:04:01 ledger-service WARN ledger-db query latency increased to 700 ms
+2030-03-20 09:04:03 ledger-service WARN ledger-db query latency increased to 820 ms
+2030-03-20 09:04:06 ledger-service WARN DbPool active=72 idle=28 total=100
+2030-03-20 09:05:01 ledger-service WARN pool_usage=84%
+2030-03-20 09:05:05 ledger-service WARN Connection wait time 2200ms
+
+2030-03-20 09:06:01 ledger-service ERROR SQLTimeoutException timeout waiting for connection
+2030-03-20 09:06:02 ledger-service ERROR pool_usage=96%
+2030-03-20 09:06:04 ledger-service ERROR Unable to obtain JDBC Connection
+
+2030-03-20 09:06:06 account-service ERROR downstream ledger-service unavailable
+2030-03-20 09:06:08 web-gateway ERROR HTTP 503 Service Unavailable
+
+2030-03-20 09:06:15 ledger-service ERROR SQLTimeoutException timeout waiting for connection
+2030-03-20 09:06:16 ledger-service ERROR SQLTimeoutException timeout waiting for connection
+
+2030-03-20 09:06:20 ledger-db ERROR Session leak detected in ledger-service
+2030-03-20 09:06:24 ledger-db ERROR JDBC connection starvation detected
+2030-03-20 09:06:30 pager-alerts ERROR P1 INCIDENT DECLARED
+2030-03-20 09:07:17 ledger-service ERROR DbPool exhausted
+
+2030-03-20 09:08:05 oncall-engineer INFO Session leak identified
+2030-03-20 09:08:10 oncall-engineer INFO Restarting ledger-service pool
+2030-03-20 09:09:05 ledger-service INFO pool_usage=60%
+2030-03-20 09:10:01 account-service INFO Account processing resumed
+2030-03-20 09:10:10 web-gateway INFO HTTP 200 responses restored
+2030-03-20 09:10:30 pager-alerts INFO INCIDENT RESOLVED

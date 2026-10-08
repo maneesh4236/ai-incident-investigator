@@ -57,3 +57,14 @@ class DocumentLoader:
         if "arch" in name or "design" in name:
             return DocumentType.ARCHITECTURE_DOC
         return DocumentType.TEXT
+
+    @staticmethod
+    def refine_doc_type(doc_type: DocumentType, path: str) -> DocumentType:
+        """Content sniffing: a .txt (or extension-less) file that is mostly
+        timestamped lines is a log and goes through event parsing."""
+        if doc_type == DocumentType.TEXT and Path(path).suffix.lower() in ("", ".txt", ".out"):
+            from app.services.ingestion.log_loader import LogEventParser
+
+            if LogEventParser.looks_like_log(path):
+                return DocumentType.LOG
+        return doc_type

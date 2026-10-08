@@ -2,19 +2,20 @@
 POST /investigate           -> runs the RCA pipeline for an investigation
 GET  /timeline/{id}         -> returns the reconstructed timeline
 GET  /report/{id}           -> returns the generated RCA report
+
+`/investigate` makes exactly ONE logical Gemini call (enforced by the
+request's metrics scope). Gemini problems (429/5xx/timeout/quota/invalid
+output) produce a degraded, deterministic report with HTTP 200; only internal
+errors return a structured 500, and the investigation is never left in
+PROCESSING.
 """
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from app.core.dependencies import (
-    get_hybrid_retriever,
-    get_incident_repository,
-    get_report_generator,
-    get_root_cause_analyzer,
-    get_timeline_builder,
-)
+from app.core.dependencies import get_incident_repository, get_investigation_service
 from app.core.logging_config import get_logger
+from app.core.metrics import metrics_scope
 from app.models.schemas import InvestigateRequest, InvestigationStatus
 
 router = APIRouter(tags=["investigate"])
@@ -24,48 +25,52 @@ _DEFAULT_QUESTION = "What was the root cause of this incident and how did it unf
 
 
 @router.post("/investigate")
-async def investigate(
+def investigate(
     request: InvestigateRequest,
     repo=Depends(get_incident_repository),
-    hybrid_retriever=Depends(get_hybrid_retriever),
-    root_cause_analyzer=Depends(get_root_cause_analyzer),
-    timeline_builder=Depends(get_timeline_builder),
-    report_generator=Depends(get_report_generator),
+    service=Depends(get_investigation_service),
 ):
     investigation = repo.get_investigation(request.investigation_id)
     if not investigation:
         raise HTTPException(status_code=404, detail="investigation_id not found")
 
-    chunks = repo.chunks_for_investigation(request.investigation_id)
-    if not chunks:
+    if not repo.chunks_for_investigation(request.investigation_id):
         raise HTTPException(
             status_code=400,
             detail="No documents ingested yet for this investigation. Upload files first via /upload.",
         )
 
-    repo.update_status(request.investigation_id, InvestigationStatus.PROCESSING)
+    if not repo.try_mark_processing(request.investigation_id):
+        raise HTTPException(status_code=409, detail="This investigation is already being processed.")
+
     question = request.question or _DEFAULT_QUESTION
+    report = None
+    with metrics_scope("investigate", max_gemini_calls=1) as metrics:
+        try:
+            report = service.run(request.investigation_id, question)
+            repo.attach_report(request.investigation_id, report)
+        except Exception as exc:
+            logger.exception(f"Investigation failed for {request.investigation_id}")
+            repo.fail_investigation(request.investigation_id, f"investigation failed: {type(exc).__name__}: {exc}")
+            raise HTTPException(
+                status_code=500,
+                detail={"error": "investigation_failed", "investigation_id": request.investigation_id,
+                        "reason": type(exc).__name__},
+            )
+        finally:
+            repo.ensure_not_processing(request.investigation_id, InvestigationStatus.FAILED)
 
-    try:
-        retrieval = hybrid_retriever.retrieve(request.investigation_id, question)
-
-        document_names = {
-            d.id: d.filename for d in repo.documents_for_investigation(request.investigation_id)
-        }
-        root_cause = root_cause_analyzer.analyze(request.investigation_id, retrieval, document_names)
-        timeline = timeline_builder.build(request.investigation_id, retrieval)
-        report = report_generator.generate(request.investigation_id, root_cause, timeline)
-
-        repo.attach_report(request.investigation_id, report)
-        return report.model_dump()
-    except Exception:
-        repo.update_status(request.investigation_id, InvestigationStatus.FAILED)
-        logger.exception(f"Investigation failed for {request.investigation_id}")
-        raise HTTPException(status_code=500, detail="Investigation pipeline failed. See server logs.")
+    report.metrics = metrics.to_dict()
+    logger.info(
+        f"investigation={request.investigation_id} gemini_logical={metrics.gemini_logical_calls} "
+        f"attempts={metrics.gemini_api_attempts} evidence_tokens={metrics.evidence_tokens_used} "
+        f"degraded={report.degraded} total_ms={metrics.stage_ms.get('total')}"
+    )
+    return report.model_dump()
 
 
 @router.get("/timeline/{investigation_id}")
-async def get_timeline(investigation_id: str, repo=Depends(get_incident_repository)):
+def get_timeline(investigation_id: str, repo=Depends(get_incident_repository)):
     investigation = repo.get_investigation(investigation_id)
     if not investigation:
         raise HTTPException(status_code=404, detail="investigation_id not found")
@@ -75,7 +80,7 @@ async def get_timeline(investigation_id: str, repo=Depends(get_incident_reposito
 
 
 @router.get("/report/{investigation_id}")
-async def get_report(investigation_id: str, repo=Depends(get_incident_repository)):
+def get_report(investigation_id: str, repo=Depends(get_incident_repository)):
     investigation = repo.get_investigation(investigation_id)
     if not investigation:
         raise HTTPException(status_code=404, detail="investigation_id not found")
@@ -85,7 +90,7 @@ async def get_report(investigation_id: str, repo=Depends(get_incident_repository
 
 
 @router.get("/investigations")
-async def list_investigations(repo=Depends(get_incident_repository)):
+def list_investigations(repo=Depends(get_incident_repository)):
     return [
         {
             "id": inv.id,
@@ -93,6 +98,7 @@ async def list_investigations(repo=Depends(get_incident_repository)):
             "status": inv.status,
             "created_at": inv.created_at,
             "document_count": len(inv.document_ids),
+            "error": inv.error,
         }
         for inv in repo.list_investigations()
     ]
