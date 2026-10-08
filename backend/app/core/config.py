@@ -65,6 +65,10 @@ class Settings(BaseSettings):
     GEMINI_TEMPERATURE: float = 0.2
     GEMINI_MAX_OUTPUT_TOKENS_INVESTIGATION: int = 2048
     GEMINI_MAX_OUTPUT_TOKENS_CHAT: int = 1024
+    # Wall-clock limit for the single chat Gemini call (all bounded attempts
+    # included). When it is hit, chat answers deterministically instead of
+    # keeping the user waiting. Never longer than GEMINI_MAX_TOTAL_SECONDS.
+    CHAT_GEMINI_DEADLINE_SECONDS: float = 35.0
 
     # --- Token budgets: hard limits on what is sent to Gemini ---
     MAX_GEMINI_CONTEXT_TOKENS: int = 6000  # whole prompt: system + instructions + evidence

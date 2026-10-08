@@ -13,10 +13,12 @@ const SUGGESTED_QUESTIONS = [
   "Show related incidents.",
 ];
 
+type DisplayMessage = ChatMessageDto & { fallback?: boolean };
+
 export default function ChatPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const investigationId = useResolvedInvestigationId(id);
-  const [messages, setMessages] = useState<ChatMessageDto[]>([]);
+  const [messages, setMessages] = useState<DisplayMessage[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -25,14 +27,22 @@ export default function ChatPage({ params }: { params: Promise<{ id: string }> }
 
   async function send(message: string) {
     if (!message.trim() || sending || !investigationId) return;
-    const nextHistory: ChatMessageDto[] = [...messages, { role: "user", content: message }];
+    const nextHistory: DisplayMessage[] = [...messages, { role: "user", content: message }];
     setMessages(nextHistory);
     setInput("");
     setSending(true);
     setError(null);
     try {
-      const response = await api.chat(investigationId, message, messages);
-      setMessages([...nextHistory, { role: "assistant", content: response.answer }]);
+      const history: ChatMessageDto[] = messages.map(({ role, content }) => ({ role, content }));
+      const response = await api.chat(investigationId, message, history);
+      setMessages([
+        ...nextHistory,
+        {
+          role: "assistant",
+          content: response.answer,
+          fallback: response.reasoning_mode === "deterministic_fallback",
+        },
+      ]);
       setLastEntities(response.referenced_entities);
     } catch (e: any) {
       setError(e.message);
@@ -74,10 +84,15 @@ export default function ChatPage({ params }: { params: Promise<{ id: string }> }
           {messages.map((m, i) => (
             <div key={i} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
               <div
-                className={`max-w-xl rounded-lg px-4 py-3 text-[13px] leading-relaxed ${
+                className={`max-w-xl whitespace-pre-line rounded-lg px-4 py-3 text-[13px] leading-relaxed ${
                   m.role === "user" ? "bg-signal/15 text-ink" : "border border-line bg-panel text-ink"
                 }`}
               >
+                {m.fallback && (
+                  <p className="mb-2 text-[11px] font-medium text-faint">
+                    Deterministic fallback (Gemini unavailable) — answered from log evidence
+                  </p>
+                )}
                 {m.content}
               </div>
             </div>

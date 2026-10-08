@@ -256,8 +256,9 @@ def test_chat_degrades_on_gemini_failure(api_client, gemini):
     r = chat(api_client, iid, "Which service failed first?")
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["degraded"] is True
-    assert "Earliest abnormal event" in body["answer"] and "First ERROR" in body["answer"]
+    assert body["degraded"] is True and body["reasoning_mode"] == "deterministic_fallback"
+    assert "earliest abnormal event was [E00005]" in body["answer"]  # WARN latency, an anomaly
+    assert "first failure" in body["answer"] and "SQLTimeoutException" in body["answer"]
     assert body["metrics"]["gemini_logical_calls"] == 1 and body["metrics"]["gemini_api_attempts"] == 3
 
 

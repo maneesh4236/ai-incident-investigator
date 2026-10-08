@@ -6,30 +6,29 @@ For each question the agent
      Qdrant relevance x2, literal id matches are protected),
   2. adds the existing report's root cause (typed) and whole recent history
      messages within MAX_CHAT_HISTORY_TOKENS,
-  3. asks Gemini once for a cited, typed answer, and validates the citations.
+  3. asks Gemini once (bounded attempts, CHAT_GEMINI_DEADLINE_SECONDS wall
+     clock) for a cited, typed answer, and validates the citations.
 
-If Gemini is unavailable the answer is built deterministically from the same
-evidence (earliest abnormal event, first ERROR per service, top matches) and
-marked degraded - it never raises.
+Gemini is the primary reasoning engine (reasoning_mode="gemini"). If the call
+fails - 503/high demand, timeout, transport error, invalid output, not
+configured - the question is answered deterministically from the SAME
+evidence by `DeterministicChatAnswerer` (reasoning_mode="deterministic_fallback",
+degraded=True). No extra Gemini call is made; it never raises for Gemini errors.
 """
 from __future__ import annotations
 
+import re
+import time
+import uuid
 from typing import List, Optional
 
 from app.core.config import get_settings
 from app.core.logging_config import get_logger
-from app.models.schemas import (
-    ChatMessage,
-    ChatResponse,
-    Claim,
-    ClaimType,
-    Evidence,
-    RCAReport,
-)
+from app.models.schemas import ChatMessage, ChatResponse, Evidence, RCAReport
 from app.repositories.incident_repository import IncidentRepository, incident_repository
-from app.services.ingestion.events import ERROR_LEVELS
+from app.services.agents.chat_fallback import DeterministicChatAnswerer
 from app.services.llm.gemini_client import GeminiClient
-from app.services.reasoning.claims import ClaimValidator, coerce_str, coerce_str_list
+from app.services.reasoning.claims import ClaimValidator, coerce_str_list, normalize_id
 from app.services.reasoning.evidence_builder import EvidenceBuilder
 from app.services.reasoning.evidence_selector import EvidencePack, EvidenceSelector
 from app.services.reasoning.investigation_service import group_point_ids
@@ -58,6 +57,7 @@ Respond ONLY with JSON:
 
 _REPORT_SUMMARY_TOKENS = 300
 _SCAFFOLD_TOKENS = 80
+_ID_IN_TEXT_RE = re.compile(r"\[?\b([ED]\d{5,})\b\]?")
 
 
 class InvestigationAgent:
@@ -84,6 +84,8 @@ class InvestigationAgent:
         report: Optional[RCAReport] = None,
     ) -> ChatResponse:
         s = self.settings
+        request_id = uuid.uuid4().hex[:12]
+        started = time.perf_counter()
         report_context = self._report_context(report)
         history_text = self._history_text(history)
         fixed = (
@@ -95,7 +97,7 @@ class InvestigationAgent:
         try:
             hits = self.hybrid_retriever.vector_retriever.retrieve(investigation_id, message, top_k=20)
         except Exception as exc:
-            logger.warning(f"Chat vector retrieval failed ({exc}); continuing without relevance scores")
+            logger.warning(f"Chat vector retrieval failed ({type(exc).__name__}); continuing without relevance scores")
             hits = []
         events = self.repo.events_for_investigation(investigation_id)
         groups = self.repo.groups_for_investigation(investigation_id)
@@ -107,8 +109,18 @@ class InvestigationAgent:
         pack.append_documents(hits, names, budget)
         evidence = pack.to_evidence(group_point_ids(self.repo, investigation_id), names)
 
+        def finish(response: ChatResponse, attempts: int) -> ChatResponse:
+            logger.info(
+                f"chat request_id={request_id} investigation={investigation_id} reasoning_mode={response.reasoning_mode} "
+                f"attempts={attempts} fallback_reason={response.degradation_reason or 'none'} "
+                f"evidence_events={len(pack.items)} evidence_tokens={pack.tokens_used} "
+                f"cited_ids={len(response.evidence_ids)} latency_ms={(time.perf_counter() - started) * 1000:.0f}"
+            )
+            return response
+
         if budget <= 0:
-            return self._answer_deterministic(pack, evidence, "question_too_long")
+            return finish(self._answer_deterministic(investigation_id, message, pack, evidence, report,
+                                                     "question_too_long"), 0)
 
         prompt = (
             f"CONVERSATION SO FAR:\n{history_text or 'none'}\n\n"
@@ -119,21 +131,46 @@ class InvestigationAgent:
         result = self.llm_client.call(
             prompt, CHAT_SYSTEM_PROMPT, purpose="chat", json_mode=True,
             max_output_tokens=s.GEMINI_MAX_OUTPUT_TOKENS_CHAT,
+            deadline_seconds=s.CHAT_GEMINI_DEADLINE_SECONDS,
         )
         if not result.ok:
-            return self._answer_deterministic(pack, evidence, result.error_kind or "gemini_error")
+            return finish(self._answer_deterministic(investigation_id, message, pack, evidence, report,
+                                                     result.error_kind or "gemini_error"), result.attempts)
 
-        data = result.data
-        answer = coerce_str(data.get("answer"), ("answer", "text"))
+        try:
+            response = self._gemini_response(investigation_id, result.data, pack, evidence)
+        except Exception as exc:  # malformed-but-parseable output must never surface as an error
+            logger.warning(f"chat request_id={request_id} could not use Gemini output ({type(exc).__name__})")
+            response = None
+        if response is None:
+            return finish(self._answer_deterministic(investigation_id, message, pack, evidence, report,
+                                                     "invalid_llm_output"), result.attempts)
+        return finish(response, result.attempts)
+
+    # ------------------------------------------------------------------ #
+    def _gemini_response(
+        self, investigation_id: str, data: dict, pack: EvidencePack, evidence: List[Evidence]
+    ) -> Optional[ChatResponse]:
+        raw_answer = data.get("answer")
+        if isinstance(raw_answer, dict):  # tolerate {"answer": {"text": "..."}}, nothing else
+            raw_answer = next((raw_answer[k] for k in ("text", "answer") if isinstance(raw_answer.get(k), str)), None)
+        answer = raw_answer.strip() if isinstance(raw_answer, str) else ""
         if not answer:
-            return self._answer_deterministic(pack, evidence, "invalid_llm_output")
+            return None
+        valid = pack.valid_event_ids
+        # Ids in the answer text that were not in the evidence are removed, never shown as citations.
+        answer = _ID_IN_TEXT_RE.sub(
+            lambda m: m.group(0) if normalize_id(m.group(1)) in valid else "[unverified id removed]", answer
+        )
 
-        validator = ClaimValidator(pack.valid_event_ids, lambda eid: self.repo.get_event(investigation_id, eid))
+        validator = ClaimValidator(valid, lambda eid: self.repo.get_event(investigation_id, eid))
         claims = validator.validate_items(data.get("claims"))
         cited = validator.citations(data.get("evidence_ids"))
-        cited_ids = []
-        for eid in [i for c in claims for i in c.evidence_ids] + cited:
-            if eid not in cited_ids:
+        cited_ids: List[str] = []
+        for eid in [i for c in claims for i in c.evidence_ids] + cited + [
+            normalize_id(m.group(1)) for m in _ID_IN_TEXT_RE.finditer(answer)
+        ]:
+            if eid and eid in valid and eid not in cited_ids:
                 cited_ids.append(eid)
         by_id = {e.event_id: e for e in evidence}
         supporting = [by_id[i] for i in cited_ids if i in by_id]
@@ -144,9 +181,11 @@ class InvestigationAgent:
             supporting_evidence=supporting,
             referenced_entities=coerce_str_list(data.get("referenced_entities")),
             claims=claims,
+            evidence_ids=cited_ids,
+            reasoning_mode="gemini",
+            degraded=False,
         )
 
-    # ------------------------------------------------------------------ #
     def _history_text(self, history: List[ChatMessage]) -> str:
         """Newest-first whole messages within MAX_CHAT_HISTORY_TOKENS (never cut a message)."""
         kept: List[str] = []
@@ -175,42 +214,45 @@ class InvestigationAgent:
             text = f"Root cause ({rc.root_cause_type.value}{', cites ' + ids if ids else ''}): see report"
         return text
 
-    def _answer_deterministic(self, pack: EvidencePack, evidence: List[Evidence], reason: str) -> ChatResponse:
-        items = pack.items
-        if not items and not pack.document_evidence:
-            return ChatResponse(
-                answer="No evidence has been ingested for this investigation yet, so this cannot be answered.",
-                degraded=True,
-                degradation_reason=reason,
-            )
-        claims: List[Claim] = []
-        lines = [f"AI reasoning is unavailable ({reason}); here is what the evidence directly shows."]
-        first_abnormal = next((i.event for i in items if i.event.level in ("WARN", "ERROR", "CRITICAL")), None)
-        first_error = next((i.event for i in items if i.event.level in ERROR_LEVELS), None)
-        if first_abnormal is not None:
-            lines.append(f"Earliest abnormal event: [{first_abnormal.id}] {first_abnormal.ts_display} "
-                         f"{first_abnormal.level} {first_abnormal.service or ''} {first_abnormal.message}")
-            claims.append(Claim(text="Earliest abnormal event", type=ClaimType.OBSERVED, evidence_ids=[first_abnormal.id]))
-        if first_error is not None:
-            lines.append(f"First ERROR: [{first_error.id}] {first_error.ts_display} {first_error.service or ''} "
-                         f"{first_error.message}")
-            claims.append(Claim(text="First ERROR event", type=ClaimType.OBSERVED, evidence_ids=[first_error.id]))
-        top = sorted(items, key=lambda i: -i.score)[:3]
-        for item in top:
-            if item.event not in (first_abnormal, first_error):
-                lines.append(f"Relevant: [{item.event.id}] {item.event.ts_display} {item.event.level or ''} "
-                             f"{item.event.service or ''} {item.event.message}")
-        lines.append("Causation between these events is not established without further analysis.")
-        cited = {i for c in claims for i in c.evidence_ids}
+    def _answer_deterministic(
+        self,
+        investigation_id: str,
+        question: str,
+        pack: EvidencePack,
+        evidence: List[Evidence],
+        report: Optional[RCAReport],
+        reason: str,
+    ) -> ChatResponse:
+        """Question-aware answer from the same evidence, with no LLM call."""
+        try:
+            graph_facts = self.hybrid_retriever.graph_retriever.graph_builder.explicit_relationships(investigation_id)
+        except Exception:
+            graph_facts = []
+        answerer = DeterministicChatAnswerer(
+            question,
+            pack,
+            self.repo.groups_for_investigation(investigation_id),
+            lambda eid: self.repo.get_event(investigation_id, eid),
+            report=report,
+            graph_facts=graph_facts,
+        )
+        result = answerer.answer(reason)
+        cited = set(result.evidence_ids)
         supporting = [e for e in evidence if e.event_id in cited] + [
             e for e in sorted(evidence, key=lambda e: -e.relevance) if e.event_id not in cited
-        ][:3]
+        ]
+        services = []
+        for eid in result.evidence_ids:
+            event = self.repo.get_event(investigation_id, eid)
+            if event is not None and event.service and event.service not in services:
+                services.append(event.service)
         return ChatResponse(
-            answer="\n".join(lines),
-            supporting_evidence=supporting[:5],
-            referenced_entities=sorted({i.event.service for i in top if i.event.service}),
-            claims=claims,
+            answer=result.answer,
+            supporting_evidence=supporting[:8],
+            referenced_entities=services[:8],
+            claims=result.claims,
+            evidence_ids=result.evidence_ids,
+            reasoning_mode="deterministic_fallback",
             degraded=True,
             degradation_reason=reason,
         )
-

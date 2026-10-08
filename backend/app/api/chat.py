@@ -43,12 +43,12 @@ def chat(
                 history=request.history,
                 report=investigation.report,
             )
-        except Exception as exc:
+        except Exception:
+            # Gemini failures never reach here (the agent falls back); this is an internal bug.
             logger.exception(f"Chat failed for {request.investigation_id}")
             raise HTTPException(
                 status_code=500,
-                detail={"error": "chat_failed", "investigation_id": request.investigation_id,
-                        "reason": type(exc).__name__},
+                detail="The chat service hit an internal error while answering. Please try again.",
             )
     response.metrics = metrics.to_dict()
     return response.model_dump()

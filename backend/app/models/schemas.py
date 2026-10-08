@@ -284,6 +284,8 @@ class ChatResponse(BaseModel):
     supporting_evidence: List[Evidence] = Field(default_factory=list)
     referenced_entities: List[str] = Field(default_factory=list)
     claims: List[Claim] = Field(default_factory=list)
+    evidence_ids: List[str] = Field(default_factory=list)  # validated ids cited by the answer
+    reasoning_mode: Literal["gemini", "deterministic_fallback"] = "gemini"
     degraded: bool = False
-    degradation_reason: Optional[str] = None
+    degradation_reason: Optional[str] = None  # sanitized category only (e.g. "server_error", "timeout")
     metrics: Optional[Dict[str, Any]] = None

@@ -109,3 +109,34 @@ def test_not_configured(monkeypatch):
     monkeypatch.setattr(get_settings(), "GEMINI_API_KEY", "")
     c = GeminiClient()
     assert not c.is_configured and c.call("p").error_kind == "not_configured"
+
+
+def test_client_error_diagnostics_are_logged_and_redacted(client):
+    from loguru import logger
+
+    configured_key = get_settings().GEMINI_API_KEY
+    fake_google_key = "AIza" + "SyFAKE0FAKE1FAKE2FAKE3FAKE4FAKE5FA"
+    details = {"error": {
+        "code": 400,
+        "message": f"API key not valid ({fake_google_key}). header x-goog-api-key: {configured_key}",
+        "status": "INVALID_ARGUMENT",
+        "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "API_KEY_INVALID",
+                     "domain": "googleapis.com"}],
+    }}
+    exc = gemini_error(400, details["error"]["message"], details)
+    exc.status = "INVALID_ARGUMENT"
+    client._client.script.append(exc)
+    lines = []
+    sink = logger.add(lambda m: lines.append(str(m)), level="WARNING", format="{message}")
+    try:
+        result = client.call("p")
+    finally:
+        logger.remove(sink)
+    assert result.error_kind == "client_error" and result.attempts == 1
+    (line,) = [l for l in lines if "gemini_api_error" in l]
+    for expected in ("kind=client_error", "http_status=400", "api_code=400", "api_status=INVALID_ARGUMENT",
+                     "reason=API_KEY_INVALID", "API key not valid", "model=fake-model",
+                     "GEMINI_API_KEY_present=YES", "GOOGLE_API_KEY_present="):
+        assert expected in line, expected
+    assert configured_key not in line and fake_google_key not in line
+    assert "[REDACTED]" in line

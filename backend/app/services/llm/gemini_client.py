@@ -20,8 +20,10 @@ Guarantees provided by `call()` (it never raises):
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
@@ -40,12 +42,41 @@ from app.services.reasoning.token_budget import estimate_tokens
 logger = get_logger("llm.gemini_client")
 
 # Shared pool used only to impose a deadline on the blocking SDK call. A timed
-# out attempt may keep its thread until the socket returns; the caller stops
-# waiting immediately.
-_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="gemini-call")
+# out attempt may keep its thread until the socket returns (the SDK has no
+# socket timeout); the caller stops waiting immediately. `_INFLIGHT` tracks
+# busy workers so that, if all of them are stuck on hung requests, new calls
+# fail fast ("unavailable") instead of queueing behind them until timeout.
+_MAX_INFLIGHT = 8
+_EXECUTOR = ThreadPoolExecutor(max_workers=_MAX_INFLIGHT, thread_name_prefix="gemini-call")
+_INFLIGHT = threading.BoundedSemaphore(_MAX_INFLIGHT)
 
 _RETRY_DELAY_RE = re.compile(r'retryDelay["\']?\s*[:=]\s*["\']?(\d+(?:\.\d+)?)s')
+
+# Masked from diagnostic log lines: (pattern, replacement).
+_SECRET_PATTERNS = [
+    # header / field assignments: "x-goog-api-key: ...", "api_key=...", "Authorization: Bearer ..."
+    (re.compile(r"(?i)\b(x-goog-api-key|authorization|api[_-]?key|access[_-]?token|password|secret)"
+                r"([\"']?\s*[:=]\s*[\"']?)(?:bearer\s+)?[^\s\"',}&]+"), r"\1\2[REDACTED]"),
+    (re.compile(r"(?i)([?&]key=)[^&\s\"']+"), r"\1[REDACTED]"),       # ?key=... in URLs
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]+"), "Bearer [REDACTED]"),
+    (re.compile(r"AIza[0-9A-Za-z_\-]{20,}"), "[REDACTED]"),            # Google API key shape
+    # long opaque tokens (letters + digits, 35+ chars)
+    (re.compile(r"\b(?=[A-Za-z0-9_\-]*\d)(?=[A-Za-z0-9_\-]*[A-Za-z])[A-Za-z0-9_\-]{35,}\b"), "[REDACTED]"),
+]
+
+
+def _redact(text: str, secrets: Optional[list] = None) -> str:
+    """Masks configured secret values and secret-shaped substrings."""
+    for secret in secrets or []:
+        if secret and len(secret) >= 8:
+            text = text.replace(secret, "[REDACTED]")
+    for pattern, replacement in _SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 _RETRYABLE = {"rate_limited", "server_error", "network", "timeout"}
+_MIN_ATTEMPT_SECONDS = 1.0  # do not start an attempt with less time than this left
 
 
 @dataclass
@@ -100,8 +131,15 @@ class GeminiClient:
         purpose: str = "generic",
         json_mode: bool = True,
         max_output_tokens: Optional[int] = None,
+        deadline_seconds: Optional[float] = None,
     ) -> GeminiResult:
+        """`deadline_seconds` optionally tightens GEMINI_MAX_TOTAL_SECONDS for this call
+        (used by chat so a struggling Gemini falls back quickly). The total limit is
+        enforced inside attempts too: each attempt's timeout is capped by the time left."""
         settings = self._settings
+        total_limit = settings.GEMINI_MAX_TOTAL_SECONDS
+        if deadline_seconds is not None:
+            total_limit = min(total_limit, deadline_seconds)
         metrics = current_metrics()
         estimated = estimate_tokens(prompt) + estimate_tokens(system_instruction or "")
 
@@ -137,6 +175,10 @@ class GeminiClient:
         last_error: Optional[_AttemptError] = None
 
         while attempts < settings.GEMINI_MAX_ATTEMPTS:
+            remaining = total_limit - (time.perf_counter() - started)
+            if attempts > 0 and remaining < _MIN_ATTEMPT_SECONDS:
+                break
+            attempt_timeout = min(settings.GEMINI_TIMEOUT_SECONDS, max(remaining, _MIN_ATTEMPT_SECONDS))
             attempts += 1
             if metrics is not None:
                 metrics.incr("gemini_api_attempts")
@@ -144,7 +186,7 @@ class GeminiClient:
                     metrics.incr("gemini_retries")
             attempt_start = time.perf_counter()
             try:
-                response = self._attempt(prompt, config)
+                response = self._attempt(prompt, config, attempt_timeout)
                 latency = (time.perf_counter() - attempt_start) * 1000
                 result = self._build_result(response, attempts, latency, estimated, json_mode)
                 self._record_attempt(metrics, purpose, attempts, "ok" if result.ok else result.error_kind, latency, result)
@@ -165,9 +207,9 @@ class GeminiClient:
                 if not retryable or attempts >= settings.GEMINI_MAX_ATTEMPTS:
                     break
                 elapsed = time.perf_counter() - started
-                remaining = settings.GEMINI_MAX_TOTAL_SECONDS - elapsed
+                remaining = total_limit - elapsed
                 delay = self._backoff(attempts, exc.retry_after)
-                if delay >= remaining:
+                if delay + _MIN_ATTEMPT_SECONDS >= remaining:
                     break
                 self._sleep(delay)
 
@@ -196,19 +238,63 @@ class GeminiClient:
     # ------------------------------------------------------------------ #
     # Internals
     # ------------------------------------------------------------------ #
-    def _attempt(self, prompt: str, config: types.GenerateContentConfig):
-        future = _EXECUTOR.submit(
-            self._client.models.generate_content, model=self._model_name, contents=prompt, config=config
-        )
+    def _attempt(self, prompt: str, config: types.GenerateContentConfig, timeout: Optional[float] = None):
+        timeout = timeout or self._settings.GEMINI_TIMEOUT_SECONDS
+        if not _INFLIGHT.acquire(blocking=False):
+            # Every worker is still blocked on an earlier (hung) request; queueing
+            # would only burn the whole timeout. Fail fast; callers fall back.
+            raise _AttemptError("unavailable", "all Gemini worker threads are busy with unfinished requests")
         try:
-            return future.result(timeout=self._settings.GEMINI_TIMEOUT_SECONDS)
+            future = _EXECUTOR.submit(
+                self._client.models.generate_content, model=self._model_name, contents=prompt, config=config
+            )
+        except Exception:
+            _INFLIGHT.release()
+            raise
+        future.add_done_callback(lambda _f: _INFLIGHT.release())
+        try:
+            return future.result(timeout=timeout)
         except FutureTimeout:
             future.cancel()
-            raise _AttemptError("timeout", f"no response within {self._settings.GEMINI_TIMEOUT_SECONDS}s")
+            raise _AttemptError("timeout", f"no response within {timeout:.0f}s")
         except genai_errors.APIError as exc:
-            raise self._classify_api_error(exc)
+            attempt_error = self._classify_api_error(exc)
+            self._log_error_diagnostics(exc, attempt_error.kind)
+            raise attempt_error
         except Exception as exc:  # network / transport / SDK errors
-            raise self._classify_other_error(exc)
+            attempt_error = self._classify_other_error(exc)
+            self._log_error_diagnostics(exc, attempt_error.kind)
+            raise attempt_error
+
+    def _log_error_diagnostics(self, exc: Exception, kind: str) -> None:
+        """Logs the real API error behind a classified attempt failure, with secrets redacted.
+
+        Never logs the API key, auth headers or any credential: the configured key
+        values and key/token/password-shaped strings are masked before logging.
+        """
+        details = getattr(exc, "details", None)
+        error_obj = details.get("error", details) if isinstance(details, dict) else {}
+        if not isinstance(error_obj, dict):
+            error_obj = {}
+        reasons = [
+            d.get("reason") for d in (error_obj.get("details") or []) if isinstance(d, dict) and d.get("reason")
+        ]
+        message = getattr(exc, "message", None) or error_obj.get("message") or str(exc)
+        secrets = [self._settings.GEMINI_API_KEY, os.environ.get("GOOGLE_API_KEY", "")]
+        logger.warning(
+            "gemini_api_error kind={} exception={} http_status={} api_code={} api_status={} reason={} "
+            "message=\"{}\" model={} GEMINI_API_KEY_present={} GOOGLE_API_KEY_present={}",
+            kind,
+            type(exc).__name__,
+            getattr(exc, "code", None),
+            error_obj.get("code"),
+            _redact(str(getattr(exc, "status", None) or error_obj.get("status")), secrets),
+            _redact(",".join(reasons) or "none", secrets),
+            _redact(str(message), secrets)[:500],
+            self._model_name,
+            "YES" if self._settings.GEMINI_API_KEY else "NO",
+            "YES" if os.environ.get("GOOGLE_API_KEY") else "NO",
+        )
 
     @staticmethod
     def _classify_api_error(exc: "genai_errors.APIError") -> _AttemptError:

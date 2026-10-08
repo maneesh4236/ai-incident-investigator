@@ -94,7 +94,16 @@ export interface ChatResponseDto {
   answer: string;
   supporting_evidence: Evidence[];
   referenced_entities: string[];
+  evidence_ids?: string[];
+  reasoning_mode?: "gemini" | "deterministic_fallback";
+  degraded?: boolean;
+  degradation_reason?: string | null;
 }
+
+// The backend answers chat within its own Gemini deadline (CHAT_GEMINI_DEADLINE_SECONDS,
+// default 35 s) and falls back deterministically; this client-side limit only guards
+// against a backend that never responds, so the UI can never stay on "Investigating…".
+const CHAT_TIMEOUT_MS = 90_000;
 
 export interface InvestigationSummary {
   id: string;
@@ -104,21 +113,44 @@ export interface InvestigationSummary {
   document_count: number;
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    ...init,
-    headers: {
-      ...(init?.body && !(init.body instanceof FormData)
-        ? { "Content-Type": "application/json" }
-        : {}),
-      ...init?.headers,
-    },
-  });
+async function request<T>(path: string, init?: RequestInit, timeoutMs?: number): Promise<T> {
+  const controller = timeoutMs ? new AbortController() : undefined;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${path}`, {
+      ...init,
+      signal: controller?.signal ?? init?.signal,
+      headers: {
+        ...(init?.body && !(init.body instanceof FormData)
+          ? { "Content-Type": "application/json" }
+          : {}),
+        ...init?.headers,
+      },
+    });
+  } catch (e: any) {
+    if (e?.name === "AbortError") {
+      throw new Error("The server took too long to respond. Please try again.");
+    }
+    throw e;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
   if (!res.ok) {
-    const detail = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(detail.detail || `Request failed: ${res.status}`);
+    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(describeDetail(body?.detail) || `Request failed: ${res.status}`);
   }
   return res.json();
+}
+
+function describeDetail(detail: unknown): string {
+  if (!detail) return "";
+  if (typeof detail === "string") return detail;
+  if (typeof detail === "object") {
+    const d = detail as Record<string, unknown>;
+    return String(d.message ?? d.error ?? d.reason ?? "Request failed");
+  }
+  return String(detail);
 }
 
 export const api = {
@@ -146,10 +178,14 @@ export const api = {
     request<RCAReport>(`/report/${investigationId}`),
 
   chat: (investigationId: string, message: string, history: ChatMessageDto[]) =>
-    request<ChatResponseDto>("/chat", {
-      method: "POST",
-      body: JSON.stringify({ investigation_id: investigationId, message, history }),
-    }),
+    request<ChatResponseDto>(
+      "/chat",
+      {
+        method: "POST",
+        body: JSON.stringify({ investigation_id: investigationId, message, history }),
+      },
+      CHAT_TIMEOUT_MS,
+    ),
 
   listInvestigations: () => request<InvestigationSummary[]>("/investigations"),
 };
