@@ -198,7 +198,12 @@ def test_gemini_failures_degrade_deterministically(api_client, gemini, failure, 
     assert report["degraded"] is True and report["degradation_reason"] == kind
     assert report["metrics"]["gemini_api_attempts"] == attempts
     assert report["metrics"]["gemini_logical_calls"] == 1
-    assert report["root_cause"]["root_cause_type"] == "UNKNOWN"
+    # The fixture explicitly reports a session leak (two sources) with exhaustion and recovery:
+    # the deterministic RCA concludes LIKELY (never CONFIRMED without an explicit causal statement).
+    assert report["root_cause"]["root_cause_type"] == "LIKELY"
+    assert "session leak in ledger-service" in report["root_cause"]["root_cause"]
+    assert report["root_cause"]["confidence_label"] in ("Medium", "High")
+    assert "explicitly report the session leak" in report["root_cause"]["confidence_explanation"]
     assert report["root_cause"]["source"] == "deterministic"
     assert report["timeline"]["events"], "deterministic timeline must still be produced"
     assert incident_repository.get_investigation(iid).status.value == "COMPLETED"
@@ -257,8 +262,9 @@ def test_chat_degrades_on_gemini_failure(api_client, gemini):
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["degraded"] is True and body["reasoning_mode"] == "deterministic_fallback"
-    assert "earliest abnormal event was [E00005]" in body["answer"]  # WARN latency, an anomaly
-    assert "first failure" in body["answer"] and "SQLTimeoutException" in body["answer"]
+    assert "ledger-service was the first service to fail" in body["answer"]
+    assert "SQLTimeoutException" in body["answer"]
+    assert "The earliest anomaly came before that: [E00005]" in body["answer"]  # WARN latency, an anomaly
     assert body["metrics"]["gemini_logical_calls"] == 1 and body["metrics"]["gemini_api_attempts"] == 3
 
 

@@ -6,7 +6,8 @@ selected evidence (ordered by parsed datetime, not by string), and each entry
 gets a phase from transparent rules:
 
   1. recovery / incident-resolved wording (non-error)     -> RECOVERY
-  2. alert / remediation / diagnosis / monitoring sources -> CONTEXT
+  2. alert / remediation / diagnosis or leak findings /
+     monitoring sources                                  -> CONTEXT
   3. deployment or config change before the first anomaly -> PRECURSOR
   4. WARN before the first ERROR: first WARN template     -> ANOMALY
                                   later WARN templates    -> DEGRADATION
@@ -152,7 +153,7 @@ class TimelineBuilder:
         before_error = first_error is None or _before(event, first_error)
         if tags & {"RECOVERY", "INCIDENT_RESOLVED"} and event.level not in ERROR_LEVELS:
             return TimelinePhase.RECOVERY
-        if tags & {"INCIDENT_DECLARED", "REMEDIATION", "DIAGNOSIS"} or (
+        if tags & {"INCIDENT_DECLARED", "REMEDIATION", "DIAGNOSIS", "LEAK"} or (
             event.service and _ALERTING_SERVICE_RE.search(event.service)
         ):
             return TimelinePhase.CONTEXT

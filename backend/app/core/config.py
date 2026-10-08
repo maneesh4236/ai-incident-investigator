@@ -63,8 +63,12 @@ class Settings(BaseSettings):
     GEMINI_BACKOFF_MAX_SECONDS: float = 8.0
     GEMINI_MAX_TOTAL_SECONDS: float = 90.0
     GEMINI_TEMPERATURE: float = 0.2
-    GEMINI_MAX_OUTPUT_TOKENS_INVESTIGATION: int = 2048
-    GEMINI_MAX_OUTPUT_TOKENS_CHAT: int = 1024
+    # OUTPUT ceilings (not the input/evidence budget). Gemini 3.x flash models are "thinking"
+    # models: hidden reasoning tokens count against max_output_tokens. With 1024 a real chat call
+    # used 983 thinking tokens and was cut off (finish_reason=MAX_TOKENS, invalid JSON), so the
+    # ceilings leave room for reasoning + the JSON answer. Billing follows actual usage.
+    GEMINI_MAX_OUTPUT_TOKENS_INVESTIGATION: int = 8192
+    GEMINI_MAX_OUTPUT_TOKENS_CHAT: int = 4096
     # Wall-clock limit for the single chat Gemini call (all bounded attempts
     # included). When it is hit, chat answers deterministically instead of
     # keeping the user waiting. Never longer than GEMINI_MAX_TOTAL_SECONDS.

@@ -26,6 +26,7 @@ from typing import Callable, Dict, List, Optional, Sequence
 from app.models.schemas import Claim, ClaimType, GraphRelationship, RCAReport, RelationType, TimelinePhase
 from app.services.ingestion.events import ERROR_LEVELS, EventGroup, LogEvent
 from app.services.reasoning.evidence_selector import EvidencePack
+from app.services.reasoning.incident_analysis import analyze_incident
 from app.services.reasoning.timeline_builder import TimelineBuilder
 
 _ALERTING_SERVICE_RE = re.compile(r"alert|monitor|pager|oncall|on-call|sre-", re.I)
@@ -39,7 +40,8 @@ _PHASE_ORDER = [
 
 # Ordered: the first matching intent wins.
 _INTENTS = [
-    ("chain", re.compile(r"cause[- ]?chain|causal chain|chain of (events|causes)|\bchain\b", re.I)),
+    ("related", re.compile(r"(related|similar|past|previous|other|prior)\s+(incidents?|outages?)|seen this before", re.I)),
+    ("chain", re.compile(r"cause[- ]?chain|causal chain|failure chain|chain of (events|causes)|\bchain\b", re.I)),
     ("start", re.compile(r"\b(first|earliest|start(ed|s)?|begin|began|onset|initial(ly)?)\b", re.I)),
     ("recovery", re.compile(r"recover|resolv|restor|mitigat|back to normal|\bfix(ed)?\b|remediat", re.I)),
     ("impact", re.compile(r"affect|impact|blast radius|customer|which services|what services|who was", re.I)),
@@ -57,6 +59,7 @@ _FRIENDLY_REASON = {
     "quota_exhausted": "the Gemini quota is exhausted",
     "unavailable": "Gemini is not accepting requests right now",
     "invalid_json": "Gemini returned an unusable response",
+    "truncated": "Gemini's answer was cut off before it was complete",
     "invalid_llm_output": "Gemini returned an unusable response",
     "empty": "Gemini returned an empty response",
     "blocked": "Gemini declined to answer",
@@ -105,6 +108,8 @@ class DeterministicChatAnswerer:
         self.cited: List[str] = []
         self.items = list(pack.items)
         self.phase: Dict[str, TimelinePhase] = self._phases()
+        # Same deterministic analysis as the RCA fallback, over ALL event groups.
+        self.analysis = analyze_incident(self.groups, lookup, self.graph_facts)
 
     # ------------------------------------------------------------------ #
     def answer(self, reason: Optional[str]) -> FallbackAnswer:
@@ -125,59 +130,100 @@ class DeterministicChatAnswerer:
     # Intent handlers
     # ------------------------------------------------------------------ #
     def _cause(self) -> str:
-        lines = ["Based on the available log evidence:"]
+        a = self.analysis
+        lines = []
         report_line = self._report_root_cause()
         if report_line:
             lines.append(report_line)
-        sequence = self._sequence_sentence()
-        if sequence:
-            lines.append(sequence)
-        diagnosis = self._diagnosis_statements()
-        if diagnosis:
-            lines.append(diagnosis)
+        lines.append(a.root_cause_statement())
+        self._cite_text(lines[-1])
+        for claim in a.claims():
+            self._claim(claim.text, claim.type, claim.evidence_ids)
+        lines.append(f"Confidence: {a.confidence_explanation()}")
         causal = self._explicit_causal_facts()
         if causal:
             lines.append(causal)
         deps = self._dependency_facts()
         if deps:
             lines.append(deps)
-        lines.append(self._causation_caveat())
+        if a.hypothesis is None:
+            lines.append(self._causation_caveat())
         return "\n".join(lines)
 
     def _chain(self) -> str:
-        steps = []
-        for phase in _PHASE_ORDER:
-            event = self._first_in_phase(phase)
-            if event is not None:
-                steps.append(f"{phase.value}: {self._fmt(event)}")
-                self._claim(f"{phase.value} begins with {event.message}", ClaimType.OBSERVED, [event.id])
+        a = self.analysis
+        steps = a.chain()
         if not steps:
             return "No abnormal events were found, so no cause chain can be built from the evidence."
-        lines = ["Observed incident chain (in time order):", *[f"  {i + 1}. {s}" for i, s in enumerate(steps)]]
+        title = ("Failure chain built from the evidence (each step is OBSERVED in the logs):" if a.hypothesis
+                 else "Observed incident chain (in time order):")
+        lines = [title]
+        for i, step in enumerate(steps, start=1):
+            ids = [eid for eid in step["evidence_ids"] if self.lookup(eid) is not None]
+            lines.append(f"  {i}. [{step['type']}] {step['step']} [{', '.join(ids)}]")
+            self._claim(step["step"], ClaimType(step["type"]), ids)
         causal = self._explicit_causal_facts()
-        lines.append(causal or "No log line explicitly states a causal link between these steps; the arrows of this "
-                     "chain are time order (OBSERVED), not established causation.")
+        if causal:
+            lines.append(causal)
+        if a.hypothesis is not None and a.hypothesis.claim_type != ClaimType.CONFIRMED:
+            lines.append(f"The links between these steps are {a.hypothesis.claim_type.value} (corroborated, but no log line "
+                         "explicitly states the causal link).")
+        elif a.hypothesis is None:
+            lines.append("No log line names a causal mechanism; the steps are time order (OBSERVED), not established "
+                         "causation.")
+        return "\n".join(lines)
+
+    def _related(self) -> str:
+        lines = ["Only this incident's logs are available to the investigator, so related past incidents cannot be "
+                 "identified from the evidence."]
+        h = self.analysis.hypothesis
+        if h is not None:
+            ids = h.evidence_ids()[:6]
+            lines.append(f"Within this incident, the events most closely related to the {h.mechanism} are: "
+                         + "; ".join(self._fmt(self.lookup(eid)) for eid in ids if self.lookup(eid)) + ".")
+            self._claim(f"Events related to the {h.mechanism}", ClaimType.OBSERVED, ids)
+        else:
+            lines.append(self._generic())
         return "\n".join(lines)
 
     def _start(self) -> str:
-        first_abnormal = self._first_abnormal()
-        first_failure = self._first_failure()
-        if first_abnormal is None:
+        a = self.analysis
+        anomaly, failure = a.earliest_anomaly, a.first_service_failure
+        if anomaly is None:
             return "No WARN or ERROR events were found; the evidence does not show when an incident started."
-        lines = [f"The earliest abnormal event was {self._fmt(first_abnormal)}."]
-        self._claim("Earliest abnormal event", ClaimType.OBSERVED, [first_abnormal.id])
-        if first_abnormal.level not in ERROR_LEVELS:
-            lines.append(f"That is a {first_abnormal.level} (an anomaly/degradation signal), not a failure.")
-        if first_failure is not None and first_failure.id != first_abnormal.id:
-            lines.append(f"The first failure (first ERROR outside alerting/remediation) was {self._fmt(first_failure)}.")
-            self._claim("First failure event", ClaimType.OBSERVED, [first_failure.id])
-            gap = _gap(first_abnormal, first_failure)
-            if gap:
-                lines.append(f"The first failure came {gap} after the first abnormal signal.")
-        elif first_failure is not None:
-            lines.append("It is also the first failure event.")
+        lines = []
+        if failure is not None:
+            lines.append(f"{failure.service or 'The first failing component'} was the first service to fail: "
+                         f"{self._fmt(failure)}.")
+            self._claim(f"First service failure: {failure.service}", ClaimType.OBSERVED, [failure.id])
         else:
-            lines.append("No ERROR-level failure event was found in the evidence.")
+            lines.append("No ERROR-level service failure was found in the evidence.")
+        if anomaly.id != (failure.id if failure else None):
+            kind = "a warning (anomaly), not a failure" if anomaly.level not in ERROR_LEVELS else "an error"
+            lines.append(f"The earliest anomaly came before that: {self._fmt(anomaly)} - {kind}.")
+            self._claim("Earliest anomaly", ClaimType.OBSERVED, [anomaly.id])
+            gap = _gap(anomaly, failure) if failure is not None else ""
+            if gap:
+                lines.append(f"The first service failure followed the earliest anomaly by {gap}.")
+        db = a.earliest_db_symptom
+        if db is not None and db.id not in (anomaly.id, failure.id if failure else None):
+            lines.append(f"Earliest database symptom: {self._fmt(db)}.")
+            self._claim("Earliest database symptom", ClaimType.OBSERVED, [db.id])
+        elif db is not None and db.id == anomaly.id:
+            lines.append("That earliest anomaly is also the earliest database symptom.")
+        first_error = a.first_error
+        if first_error is not None and first_error.id not in ([failure.id] if failure else []):
+            lines.append(f"First ERROR line of any kind: {self._fmt(first_error)}.")
+        report = a.first_unavailability_report
+        if report is not None and report.id not in (anomaly.id, failure.id if failure else None):
+            lines.append(f"First report of unavailability: {self._fmt(report)}.")
+            self._claim("First unavailability report", ClaimType.OBSERVED, [report.id])
+        prop = a.first_propagation
+        if prop is not None and (report is None or prop.id != report.id):
+            lines.append(f"First downstream propagation: {self._fmt(prop)}.")
+            self._claim("First downstream propagation", ClaimType.OBSERVED, [prop.id])
+        elif prop is not None:
+            lines.append("That is also the first downstream propagation (a dependent service failing).")
         lines.append("Being first in time does not by itself make an event the root cause.")
         return "\n".join(lines)
 
@@ -292,6 +338,12 @@ class DeterministicChatAnswerer:
                 self._claim(label, ClaimType.OBSERVED, [event.id])
         for g in [g for g in self.groups if "DIAGNOSIS" in g.tags][:3]:
             key.append(f"  - Diagnosis statement: {self._fmt(self._first_event(g))}")
+        h = self.analysis.hypothesis
+        if h is not None:
+            for factor in [f for f in h.factors if f.weight > 0][:5]:
+                ids = [i for i in factor.evidence_ids if self.lookup(i) is not None][:3]
+                key.append(f"  - Supports the {h.mechanism} explanation: {factor.label} [{', '.join(ids)}]")
+                self._cite(ids)
         stats = self.pack.stats
         lines = [
             f"{stats.get('events', 0)} log events were parsed into {stats.get('groups', 0)} distinct message types; "
@@ -299,6 +351,8 @@ class DeterministicChatAnswerer:
             "Key evidence:",
             *key,
         ]
+        if h is not None:
+            lines.append(f"Confidence in the {h.mechanism} explanation: {self.analysis.confidence_explanation()}")
         return "\n".join(lines)
 
     def _timeline(self) -> str:
@@ -465,6 +519,9 @@ class DeterministicChatAnswerer:
         self._cite([event.id])
         service = f"{event.service} " if event.service else ""
         return f"[{event.id}] {event.ts_display} {service}{event.level or ''}: {event.message}"
+
+    def _cite_text(self, text: str) -> None:
+        self._cite([m.group(0) for m in re.finditer(r"\bE\d{5,}\b", text)])
 
     def _cite(self, ids: Sequence[str]) -> None:
         for eid in ids:

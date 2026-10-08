@@ -140,3 +140,14 @@ def test_client_error_diagnostics_are_logged_and_redacted(client):
         assert expected in line, expected
     assert configured_key not in line and fake_google_key not in line
     assert "[REDACTED]" in line
+
+
+def test_max_tokens_cutoff_is_classified_as_truncated(client):
+    cut = FakeResponse('{"answer": "The first failing service was pay')
+    cut.usage_metadata = type("U", (), {"prompt_token_count": 3700, "candidates_token_count": 58,
+                                        "total_token_count": 3700 + 58 + 966})()
+    cut.candidates = [type("C", (), {"finish_reason": type("R", (), {"value": "MAX_TOKENS"})()})()]
+    client._client.script.append(cut)
+    result = client.call("p" * 40)
+    assert not result.ok and result.error_kind == "truncated" and result.attempts == 1
+    assert result.thinking_tokens == 966 and result.finish_reason == "MAX_TOKENS"

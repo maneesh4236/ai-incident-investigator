@@ -2,7 +2,9 @@
 
 import { use, useEffect, useState } from "react";
 import { api, Timeline } from "@/lib/api";
+import Link from "next/link";
 import { useResolvedInvestigationId } from "@/lib/useInvestigationId";
+import { NOT_FOUND_MESSAGE, useInvestigationStatus } from "@/lib/useInvestigationStatus";
 import { EmptyState, PageHeader, Panel, Severity } from "@/components/ui";
 
 export default function TimelinePage({ params }: { params: Promise<{ id: string }> }) {
@@ -10,14 +12,17 @@ export default function TimelinePage({ params }: { params: Promise<{ id: string 
   const investigationId = useResolvedInvestigationId(id);
   const [timeline, setTimeline] = useState<Timeline | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const lifecycle = useInvestigationStatus(investigationId);
 
   useEffect(() => {
     if (!investigationId) return;
+    if (lifecycle.state === "error") setError(lifecycle.error);
+    if (lifecycle.state !== "has_report") return; // the timeline is part of the report
     api
       .getTimeline(investigationId)
       .then(setTimeline)
       .catch((e) => setError(e.message));
-  }, [investigationId]);
+  }, [investigationId, lifecycle.state, lifecycle.error]);
 
   return (
     <div>
@@ -29,9 +34,25 @@ export default function TimelinePage({ params }: { params: Promise<{ id: string 
 
       <div className="mx-auto max-w-3xl px-8 py-8">
         {error && (
-          <Panel className="border-critical/40 p-5 text-[13px] text-critical">
-            {error}. Run an investigation from the workspace first.
-          </Panel>
+          <Panel className="border-critical/40 p-5 text-[13px] text-critical">{error}</Panel>
+        )}
+        {lifecycle.state === "not_found" && (
+          <EmptyState
+            title="Investigation not found"
+            description={NOT_FOUND_MESSAGE}
+            action={<Link href="/upload" className="text-[13px] text-signal underline">Upload logs</Link>}
+          />
+        )}
+        {lifecycle.state === "no_report" && (
+          <EmptyState
+            title="No timeline yet"
+            description="The timeline is reconstructed when the investigation runs."
+            action={
+              <Link href={`/investigate/${investigationId}`} className="text-[13px] text-signal underline">
+                Open the workspace to run the investigation
+              </Link>
+            }
+          />
         )}
 
         {timeline && timeline.events.length === 0 && (

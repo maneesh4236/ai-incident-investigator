@@ -35,6 +35,10 @@ export interface RootCauseResult {
   confidence_score: number;
   evidence: Evidence[];
   affected_systems: string[];
+  root_cause_type?: "OBSERVED" | "INFERRED" | "LIKELY" | "CONFIRMED" | "UNKNOWN";
+  confidence_label?: string | null;
+  confidence_explanation?: string | null;
+  source?: "gemini" | "deterministic";
 }
 
 export interface TimelineEvent {
@@ -58,6 +62,8 @@ export interface RCAReport {
   root_cause: RootCauseResult;
   timeline: Timeline;
   affected_systems: string[];
+  degraded?: boolean;
+  degradation_reason?: string | null;
   recommendations: string[];
   confidence: number;
 }
@@ -113,6 +119,36 @@ export interface InvestigationSummary {
   document_count: number;
 }
 
+/** Error carrying the HTTP status, so callers can treat expected states (e.g. 404) intentionally. */
+export class ApiError extends Error {
+  constructor(message: string, public status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+export function isNotFound(e: unknown): boolean {
+  return e instanceof ApiError && e.status === 404;
+}
+
+export interface InvestigationStatusDto {
+  id: string;
+  title: string;
+  status: string;
+  created_at: string;
+  document_count: number;
+  has_report: boolean;
+  degraded: boolean | null;
+  error: string | null;
+}
+
+export interface MetaDto {
+  app: string;
+  llm: { provider: string; model: string; display_name: string; configured: boolean };
+  vector_store: { backend: string; mode: string };
+  graph_store: { backend: string; connected: boolean; unavailable_reason: string | null };
+}
+
 async function request<T>(path: string, init?: RequestInit, timeoutMs?: number): Promise<T> {
   const controller = timeoutMs ? new AbortController() : undefined;
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
@@ -138,7 +174,7 @@ async function request<T>(path: string, init?: RequestInit, timeoutMs?: number):
   }
   if (!res.ok) {
     const body = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(describeDetail(body?.detail) || `Request failed: ${res.status}`);
+    throw new ApiError(describeDetail(body?.detail) || `Request failed: ${res.status}`, res.status);
   }
   return res.json();
 }
@@ -188,6 +224,11 @@ export const api = {
     ),
 
   listInvestigations: () => request<InvestigationSummary[]>("/investigations"),
+
+  getInvestigation: (investigationId: string) =>
+    request<InvestigationStatusDto>(`/investigations/${investigationId}`),
+
+  getMeta: () => request<MetaDto>("/meta"),
 };
 
 const CURRENT_INVESTIGATION_KEY = "aether:current_investigation_id";
@@ -200,4 +241,12 @@ export function getCurrentInvestigationId(): string | null {
 export function setCurrentInvestigationId(id: string) {
   if (typeof window === "undefined") return;
   window.localStorage.setItem(CURRENT_INVESTIGATION_KEY, id);
+}
+
+/** Forget the stored investigation id (e.g. after the backend restarted and no longer knows it). */
+export function clearCurrentInvestigationId(id?: string) {
+  if (typeof window === "undefined") return;
+  if (!id || window.localStorage.getItem(CURRENT_INVESTIGATION_KEY) === id) {
+    window.localStorage.removeItem(CURRENT_INVESTIGATION_KEY);
+  }
 }

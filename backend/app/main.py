@@ -3,6 +3,7 @@ FastAPI application entrypoint for the AI Incident Investigator backend.
 """
 from __future__ import annotations
 
+import re
 import threading
 
 from fastapi import FastAPI
@@ -40,6 +41,35 @@ app.include_router(graph.router, prefix=settings.API_V1_PREFIX)
 @app.get("/health")
 async def health():
     return {"status": "ok", "app": settings.APP_NAME}
+
+
+def model_display_name(model: str) -> str:
+    """'gemini-3.6-flash' -> 'Gemini 3.6 Flash' (version tokens kept as-is)."""
+    words = [p if re.match(r"^\d", p) else p.capitalize() for p in re.split(r"[-_\s]+", model or "") if p]
+    return " ".join(words) or "unknown model"
+
+
+@app.get(f"{settings.API_V1_PREFIX}/meta")
+def meta():
+    """Non-secret runtime metadata for the UI (model label, store backends)."""
+    from app.core.dependencies import get_neo4j_service
+
+    neo4j = get_neo4j_service()
+    return {
+        "app": settings.APP_NAME,
+        "llm": {
+            "provider": "Google Gemini",
+            "model": settings.GEMINI_MODEL,
+            "display_name": model_display_name(settings.GEMINI_MODEL),
+            "configured": bool(settings.GEMINI_API_KEY),
+        },
+        "vector_store": {"backend": "Qdrant", "mode": settings.QDRANT_MODE},
+        "graph_store": {
+            "backend": "Neo4j" if neo4j.is_connected else "in-memory",
+            "connected": neo4j.is_connected,
+            "unavailable_reason": getattr(neo4j, "unavailable_reason", None),
+        },
+    }
 
 
 @app.get(f"{settings.API_V1_PREFIX}/metrics")

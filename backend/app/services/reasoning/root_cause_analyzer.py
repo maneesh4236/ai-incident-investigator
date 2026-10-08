@@ -44,46 +44,48 @@ from app.services.reasoning.claims import (
     coerce_str_list,
     dict_get,
     normalize_id,
+    strip_unverified_ids,
 )
 from app.services.reasoning.evidence_builder import EvidenceBuilder
 from app.services.reasoning.evidence_selector import EvidencePack
+from app.services.reasoning.incident_analysis import (
+    ALERTING_SERVICE_RE,
+    IncidentAnalysis,
+    analyze_incident,
+    confidence_label,
+)
 from app.services.reasoning.token_budget import estimate_tokens
 
 logger = get_logger("reasoning.root_cause_analyzer")
 
-INVESTIGATION_SYSTEM_PROMPT = """You are a Principal Site Reliability Engineer performing an evidence-grounded root cause analysis.
+INVESTIGATION_SYSTEM_PROMPT = """You are a Principal SRE performing an evidence-grounded root cause analysis.
 
-EVIDENCE: complete log events, chronological, each prefixed with an id like [E00042] (documents use [D00001]).
-"^ same template xN" lines summarise repeated occurrences and list their ids. Nothing else is known.
+EVIDENCE: complete log events in time order, each prefixed by an id like [E00042] (documents: [D00001]). "^ same template xN" lines summarise repeats and list their ids. Nothing else is known about this incident.
 
 RULES
-1. Use only the evidence provided. Cite ids for every claim in "evidence_ids". Never cite an id that is not shown.
-2. Classify every claim:
-   OBSERVED  = directly stated by the cited event(s)
-   INFERRED  = reasoned from cited events but not stated
-   LIKELY    = best-supported explanation, not proven
-   CONFIRMED = a cited event explicitly states the diagnosis/cause ("root cause", "identified", "caused by", "due to")
-   UNKNOWN   = evidence is insufficient
-3. Correlation is not causation. Events close in time, or a warning that precedes a failure, do not prove one caused the other.
-4. The earliest warning is not automatically the root cause.
-5. A metric below 100% (e.g. "pool usage 78%") is not exhaustion unless an event explicitly reports exhaustion, timeout or starvation.
-6. Use precise vocabulary: warning/anomaly (abnormal signal), degradation (worsening performance), failure (errors / requests failing),
-   propagation (failure spreading to dependents), recovery. Do not call something a failure unless an ERROR/failure event supports it.
-7. If the evidence cannot establish something, say "Evidence is insufficient to establish this." and use type UNKNOWN.
-8. Timeline: you may relabel the phase of skeleton entries (by their event_id) only; do not add events.
+1. Incident-specific claims must cite shown ids in evidence_ids. Never invent ids, services, timestamps or causes.
+2. Claim types: OBSERVED = stated by the cited events; INFERRED = reasoned from cited events; LIKELY = best-supported explanation, not proven; CONFIRMED = a cited event explicitly states the cause ("root cause ...", "caused by", "due to"); UNKNOWN = insufficient evidence.
+3. Time order is not causation. Never turn co-occurrence, RELATED_TO or PRECEDES into a cause. A metric below 100% is not exhaustion unless an event says so.
+4. Keep separate: earliest anomaly, first explicit service failure, propagation to dependents, root cause, recovery. The earliest anomaly or first error is NOT automatically the root cause: prefer the explanation with the strongest corroboration (explicit diagnostic statements, consistent resource exhaustion, recovery after the matching remediation).
+5. Vocabulary: anomaly (abnormal signal), degradation (worsening), failure (errors / failing requests), propagation (dependents failing), recovery. Call it a failure only if an ERROR/failure event supports it.
+6. If evidence is insufficient, say "Evidence is insufficient to establish this." No generic filler or advice unrelated to the evidence.
+7. Timeline: you may relabel skeleton entries (by event_id) only.
 
-Respond ONLY with JSON in exactly this shape:
-{
-  "root_cause": {"statement": "...", "type": "OBSERVED|INFERRED|LIKELY|CONFIRMED|UNKNOWN", "evidence_ids": ["E00001"]},
-  "cause_chain": [{"step": "...", "type": "...", "evidence_ids": ["..."]}],
-  "claims": [{"text": "...", "type": "...", "evidence_ids": ["..."]}],
-  "timeline": [{"event_id": "E00001", "phase": "PRECURSOR|ANOMALY|DEGRADATION|FAILURE|PROPAGATION|RECOVERY|CONTEXT"}],
-  "affected_systems": [{"name": "service-name", "impact": "warning|degraded|failed|unknown", "evidence_ids": ["..."]}],
-  "executive_summary": "2-4 factual sentences",
-  "recommendations": ["specific, actionable item"],
-  "insufficient_evidence": ["what cannot be established and why"],
-  "confidence": 0.0
-}"""
+Respond ONLY with JSON:
+{"executive_summary": "2-4 factual sentences citing ids",
+ "earliest_anomaly": {"statement": "...", "evidence_ids": []},
+ "root_cause": {"statement": "...", "type": "OBSERVED|INFERRED|LIKELY|CONFIRMED|UNKNOWN", "evidence_ids": []},
+ "cause_chain": [{"step": "mechanism step", "type": "...", "evidence_ids": []}],
+ "first_service_failure": {"statement": "...", "evidence_ids": []},
+ "propagation": [{"text": "...", "type": "...", "evidence_ids": []}],
+ "affected_systems": [{"name": "service", "impact": "warning|degraded|failed|unknown", "evidence_ids": []}],
+ "recovery": [{"text": "...", "type": "...", "evidence_ids": []}],
+ "claims": [{"text": "...", "type": "...", "evidence_ids": []}],
+ "timeline": [{"event_id": "E00001", "phase": "PRECURSOR|ANOMALY|DEGRADATION|FAILURE|PROPAGATION|RECOVERY|CONTEXT"}],
+ "confidence": 0.0,
+ "confidence_explanation": "why, in terms of evidence quality",
+ "recommendations": ["action tied to the evidence"],
+ "insufficient_evidence": ["unknowns / limitations"]}"""
 
 _PROMPT_SCAFFOLD_TOKENS = 120
 
@@ -188,7 +190,10 @@ class RootCauseAnalyzer:
         graph_facts: Sequence[str],
         event_lookup: Callable[[str], Optional[LogEvent]],
         evidence: List[Evidence],
+        analysis: Optional[IncidentAnalysis] = None,
     ) -> InvestigationResult:
+        if analysis is None:
+            analysis = analyze_incident(_groups_of(pack), event_lookup)
         prompt = self.build_prompt(question, pack, timeline, graph_facts)
         estimated = estimate_tokens(INVESTIGATION_SYSTEM_PROMPT) + estimate_tokens(prompt)
         metrics = current_metrics()
@@ -197,7 +202,7 @@ class RootCauseAnalyzer:
             metrics.incr("context_budget_tokens", self.settings.MAX_GEMINI_CONTEXT_TOKENS)
 
         if not pack.items and not pack.document_evidence:
-            result = self.deterministic_result(investigation_id, pack, timeline, evidence, "no_evidence")
+            result = self.deterministic_result(investigation_id, pack, timeline, evidence, "no_evidence", analysis)
             result.prompt_tokens_estimated = 0
             return result
 
@@ -210,15 +215,20 @@ class RootCauseAnalyzer:
         )
         if not llm.ok:
             logger.warning(f"Investigation Gemini call unavailable ({llm.error_kind}); using deterministic fallback")
-            result = self.deterministic_result(investigation_id, pack, timeline, evidence, llm.error_kind or "gemini_error")
+            result = self.deterministic_result(investigation_id, pack, timeline, evidence, llm.error_kind or "gemini_error",
+                                              analysis)
             result.prompt_tokens_estimated = estimated
             return result
 
-        parsed = self._parse(investigation_id, llm.data, pack, timeline, event_lookup, evidence)
+        try:
+            parsed = self._parse(investigation_id, llm.data, pack, timeline, event_lookup, evidence, analysis)
+        except Exception as exc:  # schema-invalid output must degrade, never error
+            logger.warning(f"Investigation Gemini output unusable ({type(exc).__name__}); using deterministic fallback")
+            parsed = None
         if parsed is None:
             if metrics is not None:
                 metrics.record_error("invalid_llm_output")
-            result = self.deterministic_result(investigation_id, pack, timeline, evidence, "invalid_llm_output")
+            result = self.deterministic_result(investigation_id, pack, timeline, evidence, "invalid_llm_output", analysis)
             result.prompt_tokens_estimated = estimated
             return result
         parsed.prompt_tokens_estimated = estimated
@@ -232,21 +242,46 @@ class RootCauseAnalyzer:
         timeline: Timeline,
         event_lookup: Callable[[str], Optional[LogEvent]],
         evidence: List[Evidence],
+        analysis: Optional[IncidentAnalysis] = None,
     ) -> Optional[InvestigationResult]:
-        validator = ClaimValidator(pack.valid_event_ids, event_lookup)
+        valid = pack.valid_event_ids
+        validator = ClaimValidator(valid, event_lookup)
 
         raw_root = data.get("root_cause")
         if isinstance(raw_root, dict):
-            statement = coerce_str(raw_root, ("statement", "text", "root_cause"))
+            statement = next((raw_root[k].strip() for k in ("statement", "text", "root_cause")
+                              if isinstance(raw_root.get(k), str) and raw_root[k].strip()), "")
+            if not statement:
+                return None  # an object without a statement is a schema error, never str(dict)
             root_claim = validator.validate(statement, raw_root.get("type"), raw_root.get("evidence_ids"))
-        else:
-            statement = coerce_str(raw_root)
+        elif isinstance(raw_root, str):
+            statement = raw_root.strip()
             root_claim = validator.validate(statement, data.get("root_cause_type"), data.get("root_cause_evidence_ids"))
+        else:
+            return None
+        statement = strip_unverified_ids(statement, valid)
         if not statement:
             return None
 
         chain_claims = validator.validate_items(data.get("cause_chain"), ("step", "text", "statement"))
         claims = validator.validate_items(data.get("claims"))
+        milestones: Dict[str, object] = {}
+        for key in ("earliest_anomaly", "first_service_failure"):
+            raw = data.get(key)
+            if isinstance(raw, dict) and coerce_str(raw, ("statement", "text")):
+                claim = validator.validate(strip_unverified_ids(coerce_str(raw, ("statement", "text")), valid),
+                                           raw.get("type") or "OBSERVED", raw.get("evidence_ids"))
+                milestones[key] = claim.model_dump()
+                claims.append(Claim(text=f"{key.replace('_', ' ').capitalize()}: {claim.text}", type=claim.type,
+                                    evidence_ids=claim.evidence_ids, citations_valid=claim.citations_valid))
+        for key in ("propagation", "recovery"):
+            items = validator.validate_items(data.get(key))
+            if items:
+                milestones[key] = [c.model_dump() for c in items]
+                claims.extend(Claim(text=f"{key.capitalize()}: {c.text}", type=c.type, evidence_ids=c.evidence_ids,
+                                    citations_valid=c.citations_valid) for c in items)
+        for claim in chain_claims + claims:
+            claim.text = strip_unverified_ids(claim.text, valid)
 
         overrides: Dict[str, TimelinePhase] = {}
         raw_timeline = data.get("timeline")
@@ -269,9 +304,18 @@ class RootCauseAnalyzer:
                 affected.append(name)
 
         confidence = cap_confidence(coerce_confidence(dict_get(data, "confidence", "confidence_score"), 0.5), root_claim.type)
-        summary = coerce_str(data.get("executive_summary"))
+        summary = strip_unverified_ids(coerce_str(data.get("executive_summary") or data.get("incident_summary")), valid)
         recommendations = coerce_str_list(data.get("recommendations"))
         insufficient = coerce_str_list(data.get("insufficient_evidence"))
+        label = confidence_label(confidence)
+        explanation = data.get("confidence_explanation")
+        if isinstance(explanation, str) and explanation.strip():
+            explanation = f"{label}: {strip_unverified_ids(explanation.strip(), valid)}"
+        else:
+            explanation = (f"{label}: as assessed by Gemini ({root_claim.type.value} root cause citing "
+                           f"{len(root_claim.evidence_ids)} validated event(s)).")
+        if analysis is not None:
+            milestones.setdefault("deterministic", analysis.milestones_dict())
 
         root = RootCauseResult(
             root_cause=statement,
@@ -284,6 +328,9 @@ class RootCauseAnalyzer:
             claims=chain_claims + claims,
             insufficient_evidence=insufficient,
             source="gemini",
+            confidence_label=label,
+            confidence_explanation=explanation,
+            milestones=milestones,
         )
         if validator.rejected_ids:
             logger.warning(f"Rejected {len(validator.rejected_ids)} invented/unknown evidence ids: {validator.rejected_ids[:10]}")
@@ -303,74 +350,84 @@ class RootCauseAnalyzer:
     # Deterministic fallback (Gemini unavailable / failed / invalid output)
     # ------------------------------------------------------------------ #
     def deterministic_result(
-        self, investigation_id: str, pack: EvidencePack, timeline: Timeline, evidence: List[Evidence], reason: str
+        self,
+        investigation_id: str,
+        pack: EvidencePack,
+        timeline: Timeline,
+        evidence: List[Evidence],
+        reason: str,
+        analysis: Optional[IncidentAnalysis] = None,
     ) -> InvestigationResult:
-        items = pack.items
-        first_abnormal = next((i.event for i in items if i.event.level in ("WARN", "ERROR", "CRITICAL")), None)
-        first_error = next((i.event for i in items if i.event.level in ERROR_LEVELS), None)
-        first_recovery = next(
-            (e for e in timeline.events if e.phase == TimelinePhase.RECOVERY and e.event_ids), None
-        )
-
-        claims: List[Claim] = []
-        if first_abnormal is not None:
-            claims.append(Claim(text=f"Earliest abnormal event ({first_abnormal.level}) at {first_abnormal.ts_display}: "
-                                f"{first_abnormal.message}", type=ClaimType.OBSERVED, evidence_ids=[first_abnormal.id]))
-        seen_services = set()
-        for item in items:
-            e = item.event
-            if e.level in ERROR_LEVELS and e.service not in seen_services and len(seen_services) < 6:
-                seen_services.add(e.service)
-                claims.append(Claim(text=f"First ERROR from {e.service or 'unknown service'} at {e.ts_display}: {e.message}",
-                                    type=ClaimType.OBSERVED, evidence_ids=[e.id]))
-        if first_recovery is not None:
-            claims.append(Claim(text=f"First recovery signal at {first_recovery.timestamp}: {first_recovery.title}",
-                                type=ClaimType.OBSERVED, evidence_ids=first_recovery.event_ids[:1]))
-
-        if first_abnormal is None:
-            statement = ("No WARN/ERROR events were found in the evidence. Evidence is insufficient to establish "
-                         "an incident or its root cause.")
+        """Evidence-scored RCA without an LLM (see incident_analysis for the scoring rules)."""
+        if analysis is None:
+            by_id = {i.event.id: i.event for i in pack.items}
+            analysis = analyze_incident(_groups_of(pack), by_id.get)
+        h = analysis.hypothesis
+        anomaly = analysis.earliest_anomaly
+        if h is not None:
+            root_type, confidence = h.claim_type, h.confidence
+            root_ids = (h.finding_ids[:3] + h.exhaustion_ids[:1])
         else:
-            statement = ("Evidence is insufficient to establish a root cause automatically "
-                         f"(AI reasoning unavailable: {reason}). Earliest abnormal event: [{first_abnormal.id}] "
-                         f"{first_abnormal.message}.")
-            if first_error is not None:
-                statement += f" First ERROR: [{first_error.id}] {first_error.service or ''} {first_error.message}."
-
-        chain: List[str] = []
-        chain_struct: List[dict] = []
-        for phase in (TimelinePhase.PRECURSOR, TimelinePhase.ANOMALY, TimelinePhase.DEGRADATION,
-                      TimelinePhase.FAILURE, TimelinePhase.PROPAGATION, TimelinePhase.RECOVERY):
-            entry = next((e for e in timeline.events if e.phase == phase and e.event_ids), None)
-            if entry is not None:
-                text = f"{phase.value}: [{entry.event_ids[0]}] {entry.title} (observed sequence; causation not established)"
-                chain.append(text)
-                chain_struct.append({"step": text, "type": ClaimType.OBSERVED.value, "evidence_ids": entry.event_ids[:1]})
-
-        affected = sorted({i.event.service for i in items if i.event.level in ERROR_LEVELS and i.event.service})
+            root_type = ClaimType.UNKNOWN
+            confidence = 0.15 if anomaly is not None else 0.1
+            root_ids = [anomaly.id] if anomaly is not None else []
+        chain_struct = analysis.chain()
+        affected = sorted({i.event.service for i in pack.items if i.event.level in ERROR_LEVELS and i.event.service
+                           and not ALERTING_SERVICE_RE.search(i.event.service)})
+        insufficient = list(h.limitations) if h is not None else []
+        if h is None or root_type != ClaimType.CONFIRMED:
+            insufficient.append("No log line explicitly states the causal link; the root cause is assessed from "
+                                "corroborating evidence, not proven.")
         root = RootCauseResult(
-            root_cause=statement,
-            cause_chain=chain,
-            confidence_score=0.2 if first_abnormal is not None else 0.1,
+            root_cause=analysis.root_cause_statement(),
+            cause_chain=[step["step"] for step in chain_struct],
+            confidence_score=confidence,
             evidence=evidence,
             affected_systems=affected,
-            root_cause_type=ClaimType.UNKNOWN,
-            root_cause_evidence_ids=[first_abnormal.id] if first_abnormal is not None else [],
-            claims=claims,
-            insufficient_evidence=["Root cause could not be reasoned about without the AI reasoning step; "
-                                   "the observed sequence is shown instead."],
+            root_cause_type=root_type,
+            root_cause_evidence_ids=[i for i in root_ids if i],
+            claims=analysis.claims(),
+            insufficient_evidence=insufficient,
             source="deterministic",
+            confidence_label=confidence_label(confidence),
+            confidence_explanation=analysis.confidence_explanation(),
+            milestones={"deterministic": analysis.milestones_dict()},
         )
         return InvestigationResult(
             root_cause=root,
             timeline=timeline,
             executive_summary=self._deterministic_summary(root, timeline, pack),
-            recommendations=self._default_recommendations(root.confidence_score)
-            + ["Re-run the investigation when the Gemini API is available for an evidence-cited root cause."],
+            recommendations=self._evidence_recommendations(analysis)
+            + ["Re-run the investigation when the Gemini API is available for a fully reasoned, evidence-cited RCA."],
             degraded=True,
             degradation_reason=reason,
             cause_chain_structured=chain_struct,
         )
+
+    @staticmethod
+    def _evidence_recommendations(analysis: IncidentAnalysis) -> List[str]:
+        h = analysis.hypothesis
+        recs: List[str] = []
+        if h is not None and h.kind == "change":
+            recs.append(f"Review the change that preceded the incident ({h.mechanism}) before re-deploying it, and add "
+                        "canary checks with automatic rollback.")
+        elif h is not None:
+            where = f" in {h.service}" if h.service else ""
+            if "leak" in h.mechanism:
+                resource = h.mechanism.replace(" leak", "")
+                recs.append(f"Find and fix the {h.mechanism}{where}: ensure every acquired {resource} is released "
+                            f"(finally/try-with-resources) and enable leak detection for it.")
+            else:
+                recs.append(f"Address the {h.mechanism}{where} identified in the logs [{', '.join(h.finding_ids[:2])}].")
+            if h.exhaustion_ids:
+                recs.append(f"Alert on {h.mechanism.split()[0]}/connection pool utilisation before it reaches exhaustion "
+                            f"(exhaustion seen at [{h.exhaustion_ids[0]}]).")
+        precursor = analysis.precursor()
+        if precursor is not None:
+            recs.append(f"Alert on the early signal \"{precursor.message}\" [{precursor.id}] to detect this pattern sooner.")
+        if not recs:
+            recs.append("Gather additional logs/traces: the current evidence does not name a causal mechanism.")
+        return recs
 
     @staticmethod
     def _deterministic_summary(root: RootCauseResult, timeline: Timeline, pack: EvidencePack) -> str:
@@ -379,11 +436,13 @@ class RootCauseAnalyzer:
         for p in phases:
             if p not in ordered:
                 ordered.append(p)
+        # Headline only: the full reasoning is already in root_cause (no duplication).
+        headline = root.root_cause.split("]. ", 1)[0] + "]." if "]. " in root.root_cause else root.root_cause.split(". ")[0] + "."
         return (
+            f"{headline} "
             f"{pack.stats.get('events', 0)} log events were parsed into {pack.stats.get('groups', 0)} distinct templates; "
             f"{len(pack.items)} complete events were selected as evidence. "
-            f"Observed phases: {' -> '.join(ordered) or 'none'}. "
-            f"Root cause ({root.root_cause_type.value}): {root.root_cause}"
+            f"Observed phases: {' -> '.join(ordered) or 'none'}."
         )
 
     @staticmethod
@@ -456,3 +515,13 @@ class RootCauseAnalyzer:
             evidence=evidence[:8],
             affected_systems=affected,
         )
+
+
+def _groups_of(pack: EvidencePack) -> List:
+    """Distinct event groups present in an evidence pack (fallback when no full analysis is supplied)."""
+    seen, groups = set(), []
+    for item in pack.items:
+        if item.group.id not in seen:
+            seen.add(item.group.id)
+            groups.append(item.group)
+    return groups

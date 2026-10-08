@@ -243,14 +243,22 @@ class EvidenceSelector:
                 if first and ctx.in_precursor_window(first):
                     try_add(first, "T2", True)
 
-        # ---- T3: diagnosis, declaration, first recovery, last abnormal ----
+        # ---- T3: diagnosis / leak / starvation findings, declaration, remediation, first recovery,
+        #          last abnormal (root-cause statements must never lose out on vector similarity) ----
         for g in sorted(groups, key=lambda g: group_pos[g.id][0][0]):
-            if g.tags & {"DIAGNOSIS", "INCIDENT_DECLARED"} and ctx.in_incident_span(events_by_id[g.first_event_id]):
+            if g.tags & {"DIAGNOSIS", "INCIDENT_DECLARED", "LEAK", "STARVATION"} and ctx.in_incident_span(
+                events_by_id[g.first_event_id]
+            ):
                 try_add(events_by_id.get(g.first_event_id), "T3", True)
         if ctx.first_recovery is not None:
             try_add(ctx.first_recovery, "T3", True)
         if ctx.last_abnormal is not None:
             try_add(ctx.last_abnormal, "T3", True)
+        for g in sorted(groups, key=lambda g: group_pos[g.id][0][0]):
+            if "REMEDIATION" in g.tags and g.level not in ERROR_LEVELS and ctx.in_incident_span(
+                events_by_id[g.first_event_id]
+            ):
+                try_add(events_by_id.get(g.first_event_id), "T3", True)
 
         # ---- T4: distinct occurrences hidden by deduplication ----
         abnormal_groups = sorted((g for g in groups if g.level in ("WARN", "ERROR", "CRITICAL")), key=lambda g: -scores[g.id])

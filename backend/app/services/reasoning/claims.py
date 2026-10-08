@@ -162,3 +162,15 @@ def dict_get(data: Dict[str, Any], *keys: str) -> Any:
         if key in data and data[key] not in (None, ""):
             return data[key]
     return None
+
+
+_TEXT_ID_RE = re.compile(r"\[?\b([ED]\d{5,})\b\]?")
+
+
+def strip_unverified_ids(text: str, valid_ids: Set[str]) -> str:
+    """Replaces evidence ids in free text that were not in the evidence with a marker."""
+    if not text:
+        return text
+    return _TEXT_ID_RE.sub(
+        lambda m: m.group(0) if normalize_id(m.group(1)) in valid_ids else "[unverified id removed]", text
+    )

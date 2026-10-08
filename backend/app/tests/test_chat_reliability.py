@@ -90,9 +90,12 @@ def test_gemini_503_falls_back_with_useful_answer(api_client, gemini):
     assert body["metrics"]["gemini_logical_calls"] == 1 and body["metrics"]["gemini_api_attempts"] == 3
     answer = body["answer"]
     assert "AI reasoning is unavailable" not in answer
-    assert "earliest abnormal event was [E00005]" in answer  # first WARN: ledger-db latency
-    assert "first failure [E" in answer and "SQLTimeoutException" in answer
-    assert "Session leak identified" in answer  # diagnosis statement written in the logs
+    # Explicit, corroborated session-leak evidence -> LIKELY (never CONFIRMED without a causal statement)
+    assert "Likely root cause (LIKELY" in answer and "session leak in ledger-service" in answer
+    assert "SQLTimeoutException" in answer  # the implicated service's failure is cited
+    # the earliest anomaly (ledger-db latency WARN) is a precursor, not the root cause
+    assert "[E00005] appears to be an early anomaly/precursor" in answer
+    assert "Confidence: " in answer and "not CONFIRMED" in answer
     assert len(assert_ids_valid(iid, body)) >= 4
     # no internal error details leak into the answer
     assert "UNAVAILABLE" not in answer and "Traceback" not in answer and "503" not in answer.split("(Note:")[1]
@@ -188,7 +191,8 @@ def test_answers_differ_by_question_and_are_useful(api_client, gemini):
     assert len(set(answers.values())) == len(answers), "each question gets its own answer"
     assert "Recovery signals observed" in answers["How did it recover?"]
     assert "Session leak identified" in answers["How did it recover?"] or "Restarting" in answers["How did it recover?"]
-    assert answers["When did it start?"].startswith("The earliest abnormal event was [E00005]")
+    assert answers["When did it start?"].startswith("ledger-service was the first service to fail")
+    assert "The earliest anomaly came before that: [E00005]" in answers["When did it start?"]
     assert "TX90001" in answers["Tell me about TX90001"]
 
 
@@ -230,8 +234,10 @@ def test_related_to_is_never_presented_as_cause():
     result = answerer.answer("server_error")
     assert "Causal links stated explicitly" not in result.answer
     assert "RELATED_TO" not in result.answer and "PRECEDES" not in result.answer
-    root = [c for c in result.claims if c.text == "Root cause"]
-    assert root and root[0].type == ClaimType.UNKNOWN
+    assert all(c.type != ClaimType.CONFIRMED for c in result.claims)
+    # the only hypothesis is the deployment named in the log, never an entity from a RELATED_TO/PRECEDES edge
+    assert answerer.analysis.hypothesis.kind == "change"
+    assert "Cache" not in answerer.analysis.hypothesis.mechanism
 
 
 def test_explicit_causal_edge_is_reported_as_stated_in_logs():
@@ -246,10 +252,15 @@ def test_explicit_causal_edge_is_reported_as_stated_in_logs():
 def test_sequence_is_not_asserted_as_causation():
     answerer, _ = _answerer("minimal_incident.log", "Why did the outage happen?")
     answer = answerer.answer("server_error").answer
-    assert "does not conclusively establish which event caused the outage" in answer
-    assert "temporal correlation" in answer
-    assert not re.search(r"\b(caused|led to|resulted in)\b(?! the outage \(UNKNOWN\))", answer.replace(
-        "which event caused the outage (UNKNOWN)", ""))
+    # Deployment followed by rollback-then-recovery: only a low-confidence, INFERRED possibility.
+    assert "Possible root cause (INFERRED, Low confidence): deployment" in answer
+    assert "not CONFIRMED" in answer
+    # A log that names no causal mechanism stays UNKNOWN and says the sequence is not causation.
+    answerer2, _ = _answerer("bracketed_multiline.txt", "Why did the outage happen?")
+    answer2 = answerer2.answer("server_error").answer
+    assert "Evidence is insufficient to establish a root cause" in answer2
+    assert "temporal sequence, not established causation" in answer2
+    assert not re.search(r"\b(led to|resulted in)\b", answer2)
 
 
 # --------------------------------------------------------------------------- #

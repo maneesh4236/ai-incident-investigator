@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
-import { getCurrentInvestigationId } from "@/lib/api";
+import { api, getCurrentInvestigationId, MetaDto } from "@/lib/api";
 
 const NAV_ITEMS = [
   { href: "/", label: "Dashboard", glyph: "◆" },
@@ -25,10 +25,19 @@ function resolveHref(href: string, currentId: string | null) {
 export function Sidebar() {
   const pathname = usePathname();
   const [currentId, setCurrentId] = useState<string | null>(null);
+  const [meta, setMeta] = useState<MetaDto | null>(null);
 
   useEffect(() => {
     setCurrentId(getCurrentInvestigationId());
   }, [pathname]);
+
+  useEffect(() => {
+    // The configured model comes from the backend, so the label never goes stale.
+    api.getMeta().then(setMeta).catch(() => setMeta(null));
+  }, []);
+
+  const modelLabel = meta?.llm.display_name ?? "Gemini";
+  const graphLabel = meta && !meta.graph_store.connected ? "an in-memory graph (Neo4j unavailable)" : "Neo4j";
 
   return (
     <aside className="flex h-screen w-60 shrink-0 flex-col border-r border-line bg-panel">
@@ -68,7 +77,7 @@ export function Sidebar() {
 
       <div className="border-t border-line px-5 py-4">
         <p className="text-[11px] leading-relaxed text-faint">
-          Hybrid retrieval over Qdrant + Neo4j, reasoned by Gemini 2.5 Flash.
+          Hybrid retrieval over Qdrant + {graphLabel}, reasoned by {modelLabel}.
         </p>
       </div>
     </aside>

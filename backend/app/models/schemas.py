@@ -202,6 +202,10 @@ class RootCauseResult(BaseModel):
     claims: List[Claim] = Field(default_factory=list)
     insufficient_evidence: List[str] = Field(default_factory=list)
     source: Literal["gemini", "deterministic"] = "deterministic"
+    confidence_label: Optional[str] = None  # High | Medium | Low
+    confidence_explanation: Optional[str] = None  # why, in terms of evidence quality
+    # Kept separate on purpose: earliest anomaly, first service failure, propagation, recovery, precursor.
+    milestones: Dict[str, Any] = Field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #

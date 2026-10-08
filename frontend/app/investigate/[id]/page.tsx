@@ -4,6 +4,7 @@ import Link from "next/link";
 import { use, useEffect, useState } from "react";
 import { api, RCAReport, setCurrentInvestigationId } from "@/lib/api";
 import { useResolvedInvestigationId } from "@/lib/useInvestigationId";
+import { NOT_FOUND_MESSAGE, useInvestigationStatus } from "@/lib/useInvestigationStatus";
 import { ConfidenceBar, PageHeader, Panel, PrimaryButton } from "@/components/ui";
 
 export default function WorkspacePage({ params }: { params: Promise<{ id: string }> }) {
@@ -13,17 +14,19 @@ export default function WorkspacePage({ params }: { params: Promise<{ id: string
   const [report, setReport] = useState<RCAReport | null>(null);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const lifecycle = useInvestigationStatus(investigationId);
 
   useEffect(() => {
-    if (!investigationId) return;
+    if (!investigationId || lifecycle.state === "loading" || lifecycle.state === "not_found") return;
     setCurrentInvestigationId(investigationId);
-    api
-      .getReport(investigationId)
-      .then(setReport)
-      .catch(() => {
-        /* no report yet — that's fine */
-      });
-  }, [investigationId]);
+    // Only request the report when the backend says one exists (no 404 probing).
+    if (lifecycle.state === "has_report") {
+      api
+        .getReport(investigationId)
+        .then(setReport)
+        .catch((e) => setError(e.message));
+    }
+  }, [investigationId, lifecycle.state]);
 
   async function runInvestigation() {
     if (!investigationId) return;
@@ -60,21 +63,38 @@ export default function WorkspacePage({ params }: { params: Promise<{ id: string
               className="w-full rounded-md border border-line bg-panel2 px-3 py-2 text-[13px] text-ink outline-none placeholder:text-faint focus:border-signal"
             />
             <div className="mt-4 flex justify-end">
-              <PrimaryButton onClick={runInvestigation} disabled={running}>
+              <PrimaryButton onClick={runInvestigation} disabled={running || lifecycle.state === "not_found"}>
                 {running ? "Investigating…" : report ? "Re-run investigation" : "Run investigation"}
               </PrimaryButton>
             </div>
             {error && <p className="mt-3 text-[13px] text-critical">{error}</p>}
+            {lifecycle.state === "not_found" && (
+              <p className="mt-3 text-[13px] text-muted">
+                {NOT_FOUND_MESSAGE}{" "}
+                <Link href="/upload" className="text-signal underline">
+                  Upload logs
+                </Link>
+              </p>
+            )}
           </Panel>
 
           {report && (
             <Panel className="p-5">
-              <p className="mb-1 text-[11px] text-faint">Root cause</p>
+              <p className="mb-1 text-[11px] text-faint">
+                Root cause
+                {report.root_cause.root_cause_type ? ` · ${report.root_cause.root_cause_type}` : ""}
+                {report.degraded ? " · deterministic analysis (Gemini unavailable)" : ""}
+              </p>
               <p className="text-[15px] font-medium text-ink">{report.root_cause.root_cause}</p>
               <p className="mt-3 text-[13px] leading-relaxed text-muted">{report.executive_summary}</p>
               <div className="mt-4 max-w-xs">
                 <ConfidenceBar value={report.confidence} />
               </div>
+              {report.root_cause.confidence_explanation && (
+                <p className="mt-2 text-[12px] leading-relaxed text-faint">
+                  Confidence {report.root_cause.confidence_explanation}
+                </p>
+              )}
               <div className="mt-4 flex flex-wrap gap-2">
                 {report.root_cause.cause_chain.map((step, i) => (
                   <span key={i} className="flex items-center gap-2">

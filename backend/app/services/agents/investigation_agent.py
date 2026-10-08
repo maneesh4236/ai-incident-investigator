@@ -27,7 +27,7 @@ from app.core.logging_config import get_logger
 from app.models.schemas import ChatMessage, ChatResponse, Evidence, RCAReport
 from app.repositories.incident_repository import IncidentRepository, incident_repository
 from app.services.agents.chat_fallback import DeterministicChatAnswerer
-from app.services.llm.gemini_client import GeminiClient
+from app.services.llm.gemini_client import GeminiClient, outcome_category
 from app.services.reasoning.claims import ClaimValidator, coerce_str_list, normalize_id
 from app.services.reasoning.evidence_builder import EvidenceBuilder
 from app.services.reasoning.evidence_selector import EvidencePack, EvidenceSelector
@@ -42,12 +42,16 @@ CHAT_SYSTEM_PROMPT = """You are an AI Incident Investigator answering a follow-u
 EVIDENCE: complete log events with ids like [E00042] (documents: [D00001]); "^ same template xN" lines summarise repeats.
 
 RULES
-1. Answer strictly from the evidence. Cite ids. Never cite an id that is not shown.
-2. Distinguish warning/anomaly, degradation, failure, propagation and recovery. Do not call something a failure unless an
-   ERROR/failure event supports it. For "what failed first" questions, separate the earliest abnormal signal from the first failure.
-3. Correlation or temporal order is not causation. A metric below 100% is not exhaustion unless an event says so.
-4. Classify claims as OBSERVED, INFERRED, LIKELY, CONFIRMED (a cited event explicitly states the cause) or UNKNOWN.
-5. If the evidence does not answer the question, say "Evidence is insufficient to establish this."
+1. Answer the user's exact question first (1-3 sentences), then give the supporting evidence. No generic filler.
+2. Use only the evidence; cite ids for important claims. Never cite an id that is not shown or invent services/times.
+3. Keep separate: earliest anomaly, first service failure, propagation to dependents, root cause, recovery. Do not call
+   something a failure unless an ERROR/failure event supports it. The first anomaly or first error is not automatically
+   the root cause; prefer the explanation with the strongest corroboration (explicit diagnostic statements, consistent
+   resource exhaustion, recovery after the matching remediation).
+4. Time order is not causation; never treat co-occurrence, RELATED_TO or PRECEDES as a cause. A metric below 100% is not
+   exhaustion unless an event says so.
+5. Classify claims as OBSERVED, INFERRED, LIKELY, CONFIRMED (a cited event explicitly states the cause) or UNKNOWN.
+6. If the evidence does not answer the question, say "Evidence is insufficient to establish this."
 
 Respond ONLY with JSON:
 {"answer": "concise, specific answer with [E#####] citations",
@@ -112,7 +116,8 @@ class InvestigationAgent:
         def finish(response: ChatResponse, attempts: int) -> ChatResponse:
             logger.info(
                 f"chat request_id={request_id} investigation={investigation_id} reasoning_mode={response.reasoning_mode} "
-                f"attempts={attempts} fallback_reason={response.degradation_reason or 'none'} "
+                f"attempts={attempts} outcome={outcome_category(response.degradation_reason)} "
+                f"fallback_reason={response.degradation_reason or 'none'} degraded={response.degraded} "
                 f"evidence_events={len(pack.items)} evidence_tokens={pack.tokens_used} "
                 f"cited_ids={len(response.evidence_ids)} latency_ms={(time.perf_counter() - started) * 1000:.0f}"
             )

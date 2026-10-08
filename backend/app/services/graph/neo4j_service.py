@@ -7,6 +7,7 @@ methods with plain Python objects.
 """
 from __future__ import annotations
 
+import re
 from typing import List, Optional
 
 from neo4j import GraphDatabase
@@ -23,14 +24,22 @@ class Neo4jService:
         settings = get_settings()
         self._settings = settings
         self._driver = None
+        self.unavailable_reason: Optional[str] = None
+        target = _safe_target(settings.NEO4J_URI)
         try:
             self._driver = GraphDatabase.driver(
-                settings.NEO4J_URI, auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD)
+                settings.NEO4J_URI,
+                auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD),
+                connection_timeout=5.0,  # never stall startup on an unreachable graph
             )
             self._driver.verify_connectivity()
-            logger.info(f"Connected to Neo4j at {settings.NEO4J_URI}")
+            logger.info(f"Connected to Neo4j at {target}")
         except Exception as exc:  # pragma: no cover - depends on infra availability
-            logger.warning(f"Neo4j unavailable ({exc}); running in in-memory fallback mode")
+            self.unavailable_reason = _classify_neo4j_error(exc)
+            logger.warning(
+                f"Neo4j unavailable at {target}: {self.unavailable_reason}. The knowledge graph runs in "
+                "in-memory fallback mode (investigation and chat are unaffected)."
+            )
             self._driver = None
 
     @property
@@ -179,3 +188,28 @@ class Neo4jService:
         """
         with self._driver.session(database=self._settings.NEO4J_DATABASE) as session:
             return [dict(record["e"]) for record in session.run(query, iid=investigation_id, keyword=keyword)]
+
+
+def _safe_target(uri: str) -> str:
+    """scheme://host:port only - never credentials or query parameters."""
+    match = re.match(r"^\s*([A-Za-z0-9+]+)://(?:[^@/]*@)?([^/?#\s:]+)(?::(\d+))?", uri or "")
+    if not match:
+        return "(invalid NEO4J_URI)"
+    scheme, host, port = match.groups()
+    return f"{scheme}://{host}:{port or 7687}"
+
+
+def _classify_neo4j_error(exc: Exception) -> str:
+    """Human-readable, credential-free reason for a failed Neo4j connection."""
+    name = type(exc).__name__
+    text = str(exc).lower()
+    if "resolve" in text or "getaddrinfo" in text or "name or service not known" in text or "nodename" in text:
+        return (f"DNS resolution failed for the host ({name}) - the Aura instance may have been deleted/paused or "
+                "the hostname is wrong")
+    if "auth" in name.lower() or "unauthorized" in text or "authentication" in text:
+        return f"authentication failed ({name}) - check NEO4J_USER / NEO4J_PASSWORD"
+    if "refused" in text or "timed out" in text or "timeout" in text or "unavailable" in name.lower():
+        return f"server not reachable ({name}) - instance stopped, or network/firewall blocks port 7687"
+    if "scheme" in text or "uri" in text or "configuration" in name.lower():
+        return f"invalid NEO4J_URI ({name})"
+    return name

@@ -2,22 +2,27 @@
 
 import { use, useEffect, useState } from "react";
 import { api, RCAReport } from "@/lib/api";
+import Link from "next/link";
 import { useResolvedInvestigationId } from "@/lib/useInvestigationId";
-import { ConfidenceBar, PageHeader, Panel } from "@/components/ui";
+import { NOT_FOUND_MESSAGE, useInvestigationStatus } from "@/lib/useInvestigationStatus";
+import { ConfidenceBar, EmptyState, PageHeader, Panel } from "@/components/ui";
 
 export default function ReportPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const investigationId = useResolvedInvestigationId(id);
   const [report, setReport] = useState<RCAReport | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const lifecycle = useInvestigationStatus(investigationId);
 
   useEffect(() => {
     if (!investigationId) return;
+    if (lifecycle.state === "error") setError(lifecycle.error);
+    if (lifecycle.state !== "has_report") return; // no 404 probing before a report exists
     api
       .getReport(investigationId)
       .then(setReport)
       .catch((e) => setError(e.message));
-  }, [investigationId]);
+  }, [investigationId, lifecycle.state, lifecycle.error]);
 
   return (
     <div>
@@ -37,9 +42,25 @@ export default function ReportPage({ params }: { params: Promise<{ id: string }>
 
       <div className="mx-auto max-w-3xl space-y-6 px-8 py-8">
         {error && (
-          <Panel className="border-critical/40 p-5 text-[13px] text-critical">
-            {error}. Run an investigation from the workspace first.
-          </Panel>
+          <Panel className="border-critical/40 p-5 text-[13px] text-critical">{error}</Panel>
+        )}
+        {lifecycle.state === "not_found" && (
+          <EmptyState
+            title="Investigation not found"
+            description={NOT_FOUND_MESSAGE}
+            action={<Link href="/upload" className="text-[13px] text-signal underline">Upload logs</Link>}
+          />
+        )}
+        {lifecycle.state === "no_report" && (
+          <EmptyState
+            title="No report yet"
+            description="The RCA report is generated when the investigation runs."
+            action={
+              <Link href={`/investigate/${investigationId}`} className="text-[13px] text-signal underline">
+                Open the workspace to run the investigation
+              </Link>
+            }
+          />
         )}
 
         {report && (
@@ -53,11 +74,20 @@ export default function ReportPage({ params }: { params: Promise<{ id: string }>
             </Panel>
 
             <Panel className="p-6">
-              <p className="mb-2 text-[11px] font-medium text-faint">Root Cause</p>
+              <p className="mb-2 text-[11px] font-medium text-faint">
+                Root Cause
+                {report.root_cause.root_cause_type ? ` · ${report.root_cause.root_cause_type}` : ""}
+                {report.degraded ? " · deterministic analysis (Gemini unavailable)" : ""}
+              </p>
               <p className="text-[16px] font-semibold text-ink">{report.root_cause.root_cause}</p>
               <div className="mt-4 max-w-xs">
                 <ConfidenceBar value={report.confidence} />
               </div>
+              {report.root_cause.confidence_explanation && (
+                <p className="mt-2 text-[12px] leading-relaxed text-muted">
+                  Confidence {report.root_cause.confidence_explanation}
+                </p>
+              )}
               <p className="mb-2 mt-5 text-[11px] font-medium text-faint">Cause chain</p>
               <div className="flex flex-wrap items-center gap-2">
                 {report.root_cause.cause_chain.map((step, i) => (

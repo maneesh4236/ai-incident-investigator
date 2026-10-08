@@ -23,6 +23,7 @@ from app.models.schemas import HybridRetrievalResult, RCAReport, RetrievedGraphC
 from app.repositories.incident_repository import IncidentRepository
 from app.services.graph.graph_builder import GraphBuilder
 from app.services.reasoning.evidence_selector import EvidenceSelector
+from app.services.reasoning.incident_analysis import analyze_incident
 from app.services.reasoning.report_generator import ReportGenerator
 from app.services.reasoning.root_cause_analyzer import RootCauseAnalyzer
 from app.services.reasoning.timeline_builder import TimelineBuilder
@@ -105,6 +106,11 @@ class InvestigationService:
                 )
 
         facts = graph_fact_lines(self.graph_builder, investigation_id)
+        lookup = lambda eid: self.repo.get_event(investigation_id, eid)  # noqa: E731
+        with stage("analysis"):
+            # Local, deterministic analysis over ALL event groups (not only the selected
+            # evidence): milestones + evidence-scored hypothesis for the fallback path.
+            analysis = analyze_incident(groups, lookup, self.graph_builder.explicit_relationships(investigation_id))
         with stage("reasoning"):
             result = self.analyzer.reason(
                 investigation_id,
@@ -112,8 +118,9 @@ class InvestigationService:
                 pack,
                 timeline,
                 facts,
-                lambda eid: self.repo.get_event(investigation_id, eid),
+                lookup,
                 evidence,
+                analysis=analysis,
             )
 
         if not result.degraded and result.cause_chain_structured:

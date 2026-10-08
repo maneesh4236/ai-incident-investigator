@@ -76,6 +76,33 @@ def _redact(text: str, secrets: Optional[list] = None) -> str:
 
 
 _RETRYABLE = {"rate_limited", "server_error", "network", "timeout"}
+
+# Normalized outcome vocabulary for logs/metrics (internal error kinds stay unchanged for the API).
+_OUTCOMES = {
+    "ok": "success",
+    "quota_exhausted": "quota_exhausted",
+    "rate_limited": "rate_limited",
+    "server_error": "server_error",
+    "timeout": "timeout",
+    "network": "transport_error",
+    "unavailable": "transport_error",
+    "unexpected": "transport_error",
+    "invalid_json": "invalid_response",
+    "truncated": "invalid_response",
+    "empty": "invalid_response",
+    "blocked": "invalid_response",
+    "invalid_llm_output": "schema_error",
+    "client_error": "client_error",
+    "not_configured": "not_configured",
+    "budget_exceeded": "policy_refused",
+    "call_limit_exceeded": "policy_refused",
+    "question_too_long": "policy_refused",
+    "no_evidence": "no_evidence",
+}
+
+
+def outcome_category(kind: Optional[str]) -> str:
+    return _OUTCOMES.get(kind or "ok", kind or "success")
 _MIN_ATTEMPT_SECONDS = 1.0  # do not start an attempt with less time than this left
 
 
@@ -91,6 +118,8 @@ class GeminiResult:
     prompt_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
     estimated_prompt_tokens: int = 0
+    finish_reason: Optional[str] = None
+    thinking_tokens: Optional[int] = None  # total - prompt - output (hidden reasoning of "thinking" models)
 
 
 class _AttemptError(Exception):
@@ -334,12 +363,24 @@ class GeminiClient:
         usage = getattr(response, "usage_metadata", None)
         prompt_tokens = getattr(usage, "prompt_token_count", None) if usage else None
         output_tokens = getattr(usage, "candidates_token_count", None) if usage else None
+        total_tokens = getattr(usage, "total_token_count", None) if usage else None
+        thinking_tokens = None
+        if isinstance(total_tokens, int) and isinstance(prompt_tokens, int):
+            thinking_tokens = max(0, total_tokens - prompt_tokens - (output_tokens or 0))
+        finish_reason = None
+        try:
+            candidates = getattr(response, "candidates", None) or []
+            raw_reason = getattr(candidates[0], "finish_reason", None) if candidates else None
+            finish_reason = getattr(raw_reason, "value", None) or (str(raw_reason) if raw_reason else None)
+        except Exception:
+            finish_reason = None
         try:
             text = response.text or ""
         except Exception:  # SDK raises on some blocked responses
             text = ""
         base = dict(attempts=attempts, latency_ms=latency, prompt_tokens=prompt_tokens,
-                    output_tokens=output_tokens, estimated_prompt_tokens=estimated)
+                    output_tokens=output_tokens, estimated_prompt_tokens=estimated,
+                    finish_reason=finish_reason, thinking_tokens=thinking_tokens)
         if not text.strip():
             feedback = getattr(response, "prompt_feedback", None)
             kind = "blocked" if feedback is not None and getattr(feedback, "block_reason", None) else "empty"
@@ -348,11 +389,13 @@ class GeminiClient:
             return GeminiResult(ok=True, text=text, **base)
         data = parse_json_object(text)
         if data is None:
-            return GeminiResult(ok=False, text=text, error_kind="invalid_json", error_message="unparseable JSON", **base)
+            truncated = finish_reason is not None and "MAX_TOKENS" in finish_reason.upper()
+            return GeminiResult(ok=False, text=text, error_kind="truncated" if truncated else "invalid_json",
+                                error_message="output cut off at max_output_tokens" if truncated else "unparseable JSON",
+                                **base)
         return GeminiResult(ok=True, text=text, data=data, **base)
 
-    @staticmethod
-    def _record_attempt(metrics, purpose: str, attempt: int, status: str, latency: float, result: Optional[GeminiResult]):
+    def _record_attempt(self, metrics, purpose: str, attempt: int, status: str, latency: float, result: Optional[GeminiResult]):
         prompt_tokens = result.prompt_tokens if result else None
         output_tokens = result.output_tokens if result else None
         if metrics is not None:
@@ -363,8 +406,10 @@ class GeminiClient:
             if output_tokens:
                 metrics.incr("gemini_output_tokens", int(output_tokens))
         logger.info(
-            f"gemini_attempt purpose={purpose} attempt={attempt} status={status} "
-            f"latency_ms={latency:.0f} prompt_tokens={prompt_tokens} output_tokens={output_tokens}"
+            f"gemini_attempt purpose={purpose} attempt={attempt} status={status} outcome={outcome_category(status)} "
+            f"model={self._model_name} latency_ms={latency:.0f} prompt_tokens={prompt_tokens} output_tokens={output_tokens} "
+            f"thinking_tokens={result.thinking_tokens if result else None} "
+            f"finish_reason={result.finish_reason if result else None}"
         )
 
     @staticmethod
